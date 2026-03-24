@@ -44,10 +44,29 @@ jobs:
 
     steps:
       - name: Install base dependencies
+        shell: bash
         run: |
+          retry() {
+            local max_attempts="$1"
+            local delay_seconds="$2"
+            shift 2
+            local attempt=1
+
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Command failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              echo "Attempt ${attempt}/${max_attempts} failed: $*"
+              echo "Retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              attempt=$((attempt + 1))
+            done
+          }
+
           dnf makecache
-          dnf install -y epel-release
-          dnf install -y git git-lfs gcc-toolset-${{ github.event.inputs.gcc_version }} ccache
+          retry 10 15 dnf install -y epel-release
+          retry 10 15 dnf install -y git git-lfs gcc-toolset-${{ github.event.inputs.gcc_version }} ccache
 
           # Fix sudo PAM issue: create a sudo wrapper that bypasses password and PAM authentication
           # Since the container has the root user already, simply let sudo execute commands directly
@@ -96,9 +115,28 @@ jobs:
           fi
 
       - name: Install build dependencies
+        shell: bash
         run: |
+          retry() {
+            local max_attempts="$1"
+            local delay_seconds="$2"
+            shift 2
+            local attempt=1
+
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Command failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              echo "Attempt ${attempt}/${max_attempts} failed: $*"
+              echo "Retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              attempt=$((attempt + 1))
+            done
+          }
+
           chmod +x ~/blender-git/blender/build_files/build_environment/linux/linux_rocky8_setup.sh
-          ~/blender-git/blender/build_files/build_environment/linux/linux_rocky8_setup.sh
+          retry 10 15 ~/blender-git/blender/build_files/build_environment/linux/linux_rocky8_setup.sh
           echo "Cleaning dnf cache..."
           dnf clean all
 
@@ -131,6 +169,24 @@ jobs:
         if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
         shell: bash
         run: |
+          retry() {
+            local max_attempts="$1"
+            local delay_seconds="$2"
+            shift 2
+            local attempt=1
+
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Command failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              echo "Attempt ${attempt}/${max_attempts} failed: $*"
+              echo "Retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              attempt=$((attempt + 1))
+            done
+          }
+
           source /opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/enable
           export CCACHE_DIR=/root/.ccache
           cd ~/blender-git/blender
@@ -144,7 +200,7 @@ jobs:
           
           export CC=/opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/root/usr/bin/gcc
           export CXX=/opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/root/usr/bin/g++
-          make deps
+          retry 10 15 make deps
           unset CC CXX
 
       - name: Save Blender dependencies cache
