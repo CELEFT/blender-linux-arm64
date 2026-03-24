@@ -1,0 +1,54 @@
+From a248417c81274ac22126321e30d38c5417b33f54 Mon Sep 17 00:00:00 2001
+From: lfdevs <109842948+lfdevs@users.noreply.github.com>
+Date: Tue, 24 Mar 2026 15:53:10 +0800
+Subject: [PATCH] Deps: Linux arm64: Exclude ROCm installation with an
+ architecture check
+
+Skip ROCm setup on aarch64, as ROCm is not supported on ARM64 now.
+---
+ .../linux/linux_rocky8_setup.sh                | 18 ++++++++++--------
+ 1 file changed, 10 insertions(+), 8 deletions(-)
+
+diff --git a/build_files/build_environment/linux/linux_rocky8_setup.sh b/build_files/build_environment/linux/linux_rocky8_setup.sh
+index 334f456193e..3fe87c25526 100755
+--- a/build_files/build_environment/linux/linux_rocky8_setup.sh
++++ b/build_files/build_environment/linux/linux_rocky8_setup.sh
+@@ -204,10 +204,11 @@ yum -y install jack-audio-connection-kit-devel
+ # - "Install kernel driver".
+ 
+ # Register ROCm packages
+-sudo rpm --import https://repo.radeon.com/rocm/rocm.gpg.key
+-rm -f /etc/yum.repos.d/amdgpu-6.4.3.repo
+-rm -f /etc/yum.repos.d/rocm-6.4.3.repo
+-tee --append /etc/yum.repos.d/amdgpu-6.4.3.repo <<EOF
++if [ "$(uname -i)" != "aarch64" ]; then
++    sudo rpm --import https://repo.radeon.com/rocm/rocm.gpg.key
++    rm -f /etc/yum.repos.d/amdgpu-6.4.3.repo
++    rm -f /etc/yum.repos.d/rocm-6.4.3.repo
++    tee --append /etc/yum.repos.d/amdgpu-6.4.3.repo <<EOF
+ [amdgpu-6.4.3]
+ name=amdgpu-6.4.3
+ baseurl=https://repo.radeon.com/amdgpu/6.4.3/el/8.10/main/x86_64/
+@@ -216,7 +217,7 @@ priority=50
+ gpgcheck=1
+ gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key
+ EOF
+-tee --append /etc/yum.repos.d/rocm-6.4.3.repo <<EOF
++    tee --append /etc/yum.repos.d/rocm-6.4.3.repo <<EOF
+ [ROCm-6.4.3]
+ name=ROCm-6.4.3
+ baseurl=https://repo.radeon.com/rocm/el8/6.4.3/main
+@@ -225,6 +226,7 @@ gpgcheck=1
+ exclude=rock-dkms
+ gpgkey=https://repo.radeon.com/rocm/rocm.gpg.key
+ EOF
+-yum -y update
+-sudo yum install -y hipcc6.4.3 hip-devel6.4.3 rocm-llvm6.4.3 rocm-core6.4.3 rocm-device-libs6.4.3
+-sudo update-alternatives --set rocm /opt/rocm-6.4.3
++    yum -y update
++    sudo yum install -y hipcc6.4.3 hip-devel6.4.3 rocm-llvm6.4.3 rocm-core6.4.3 rocm-device-libs6.4.3
++    sudo update-alternatives --set rocm /opt/rocm-6.4.3
++fi
+-- 
+2.47.3
+
