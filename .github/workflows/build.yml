@@ -93,7 +93,7 @@ jobs:
       - name: Clone patches repository
         run: |
           cd ~/blender-git
-          git clone -b ci --depth 1 https://github.com/lfdevs/blender-linux-arm64.git patches-repo
+          git clone -b ci --depth 1 ${{ github.server_url }}/${{ github.repository }}.git patches-repo
 
       - name: Apply patches
         run: |
@@ -318,6 +318,52 @@ jobs:
             ~/blender-git/build_linux_${{ github.event.inputs.build_type }}/*.tar.gz
             ~/blender-git/build_linux_${{ github.event.inputs.build_type }}/sha256sums.txt
           retention-days: 90
+
+      - name: Notify webhook on build failure
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          if [ -z "${WEBHOOK_URL:-}" ]; then
+            echo "WEBHOOK_URL is not configured, skipping failure notification"
+            exit 0
+          fi
+
+          if ! command -v curl >/dev/null 2>&1; then
+            echo "curl is not available, skipping failure notification"
+            exit 0
+          fi
+
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          payload=$(cat <<EOF
+          {
+            "msg_type": "post",
+            "content": {
+              "post": {
+                "zh_cn": {
+                  "title": "GitHub CI Activity",
+                  "content": [
+                    [
+                      {
+                        "tag": "text",
+                        "text": "Some jobs were not successful: "
+                      },
+                      {
+                        "tag": "a",
+                        "text": "View workflow run",
+                        "href": "${RUN_URL}"
+                      }
+                    ]
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          )
+
+          curl --fail --show-error --silent -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK_URL"
 
   draft-release:
     if: ${{ github.event.inputs.draft_release == 'true' }}
