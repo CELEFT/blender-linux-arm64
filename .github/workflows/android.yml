@@ -1,0 +1,576 @@
+name: Build Blender (Android ARM64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      blender_version:
+        description: 'Blender version tag'
+        required: true
+        default: 'v5.0.1'
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - lite
+          - debug
+      gcc_version:
+        description: 'GCC version (host tools)'
+        required: true
+        default: '14'
+        type: choice
+        options:
+          - 14
+          - 11
+      android_api:
+        description: 'Android API level'
+        required: true
+        default: '34'
+      rebuild_deps:
+        description: 'Force rebuild dependencies'
+        required: false
+        default: false
+        type: boolean
+      draft_release:
+        description: 'Draft a new release'
+        required: true
+        default: false
+        type: boolean
+
+env:
+  ANDROID_NDK_HOME: /opt/android-ndk-r29
+  ANDROID_HOME: /opt/android-sdk
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: rockylinux:8
+      options: --privileged --user root
+
+    steps:
+      - name: Install base dependencies
+        shell: bash
+        run: |
+          retry() {
+            local max_attempts="$1"
+            local delay_seconds="$2"
+            shift 2
+            local attempt=1
+
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Command failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              echo "Attempt ${attempt}/${max_attempts} failed: $*"
+              echo "Retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          dnf makecache
+          retry 10 15 dnf install -y epel-release
+          retry 10 15 dnf install -y git git-lfs gcc-toolset-${{ github.event.inputs.gcc_version }} ccache
+          # Java is required for Android SDK tools (aapt2, d8, apksigner)
+          retry 10 15 dnf install -y java-1.8.0-openjdk-devel unzip wget
+
+          # Fix sudo PAM issue
+          mv /usr/bin/sudo /usr/bin/sudo.orig || true
+          cat > /usr/bin/sudo << 'EOF'
+          #!/bin/bash
+          if [ "$1" = "-y" ] || [ "$1" = "-n" ] || [ "$1" = "-E" ]; then
+            shift
+          fi
+          exec "$@"
+          EOF
+          chmod +x /usr/bin/sudo
+
+      - name: Setup Git LFS
+        run: git-lfs install
+
+      - name: Download and install Android NDK
+        shell: bash
+        run: |
+          cd /opt
+          echo "Downloading Android NDK r29..."
+          wget -q https://googledownloads.cn/android/repository/android-ndk-r29-linux.zip -O android-ndk-r29-linux.zip
+          echo "Unzipping NDK..."
+          unzip -q android-ndk-r29-linux.zip
+          rm android-ndk-r29-linux.zip
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          ls "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-arm64/bin/" | head -5
+          echo "NDK installed successfully"
+
+      - name: Download and install Android SDK command-line tools
+        shell: bash
+        run: |
+          mkdir -p /opt/android-sdk/cmdline-tools
+          cd /opt/android-sdk/cmdline-tools
+          echo "Downloading Android SDK command-line tools..."
+          wget -q https://googledownloads.cn/android/repository/commandlinetools-linux-11026798_latest.zip -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip
+          # sdkmanager expects the directory structure: cmdline-tools/latest/bin/sdkmanager
+          mv cmdline-tools latest || true
+          rm cmdline-tools.zip
+
+          echo "Installing Android SDK components..."
+          export JAVA_HOME=/usr/lib/jvm/java-1.8.0
+          yes | /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-${{ github.event.inputs.android_api }}" \
+            "build-tools;34.0.0" \
+            "platform-tools"
+          echo "Android SDK installed successfully"
+
+      - name: Clone Blender repository
+        run: |
+          mkdir -p ~/blender-git
+          cd ~/blender-git
+          git clone -b ${{ github.event.inputs.blender_version }} --single-branch --depth 1 https://projects.blender.org/blender/blender.git
+
+      - name: Clone patches repository
+        run: |
+          cd ~/blender-git
+          git clone -b ci --depth 1 ${{ github.server_url }}/${{ github.repository }}.git patches-repo
+
+      - name: Apply patches
+        run: |
+          cd ~/blender-git/blender
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          PATCH_DIR=~/blender-git/patches-repo/patches/${{ github.event.inputs.blender_version }}
+          if [ -d "$PATCH_DIR" ]; then
+            echo "Found patches directory: $PATCH_DIR"
+            for patch in $(ls -1 "$PATCH_DIR"/*.patch 2>/dev/null | sort); do
+              echo "Applying patch: $patch"
+              git apply --verbose "$patch"
+            done
+            git add -A
+            git commit -m "Apply patches for ${{ github.event.inputs.blender_version }}" || echo "No changes to commit"
+            echo "All patches applied successfully"
+          else
+            echo "No patches directory found for ${{ github.event.inputs.blender_version }}, skipping..."
+          fi
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          retry() {
+            local max_attempts="$1"
+            local delay_seconds="$2"
+            shift 2
+            local attempt=1
+
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Command failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              echo "Attempt ${attempt}/${max_attempts} failed: $*"
+              echo "Retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          chmod +x ~/blender-git/blender/build_files/build_environment/linux/linux_rocky8_setup.sh
+          retry 10 15 ~/blender-git/blender/build_files/build_environment/linux/linux_rocky8_setup.sh
+          echo "Cleaning dnf cache..."
+          dnf clean all
+
+      - name: Cache Blender dependencies (Android)
+        uses: actions/cache@v4
+        id: cache-deps
+        with:
+          path: ~/blender-git/blender/lib/android_arm64
+          key: blender-deps-android-${{ github.event.inputs.blender_version }}-api${{ github.event.inputs.android_api }}-${{ runner.os }}-${{ runner.arch }}-v1
+          restore-keys: |
+            blender-deps-android-${{ github.event.inputs.blender_version }}-api${{ github.event.inputs.android_api }}-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /root/.ccache
+          key: ccache-android-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-android-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Configure ccache
+        run: |
+          export CCACHE_DIR=/root/.ccache
+          ccache --max-size=5G
+          ccache --show-config
+          ccache --zero-stats
+          ccache --show-stats
+
+      - name: Build dependencies for Android
+        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
+        shell: bash
+        run: |
+          retry() {
+            local max_attempts="$1"
+            local delay_seconds="$2"
+            shift 2
+            local attempt=1
+
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Command failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              echo "Attempt ${attempt}/${max_attempts} failed: $*"
+              echo "Retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          source /opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/enable
+          export CCACHE_DIR=/root/.ccache
+          export ANDROID_NDK_HOME=/opt/android-ndk-r29
+
+          # Fix FLAC extract error
+          export LANG=en_US.UTF-8
+
+          cd ~/blender-git/blender
+
+          # Build dependencies targeting Android using the NDK toolchain
+          mkdir -p ~/blender-git/build_deps_android
+          cd ~/blender-git/build_deps_android
+
+          cmake -S $HOME/blender-git/blender/build_files/build_environment \
+                -G Ninja \
+                -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+                -DANDROID_PLATFORM=${{ github.event.inputs.android_api }} \
+                -DANDROID_ABI=arm64-v8a \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=$HOME/blender-git/blender/lib/android_arm64 \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+          retry 10 15 ninja install
+
+      - name: Save Blender dependencies cache (Android)
+        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/blender-git/blender/lib/android_arm64
+          key: blender-deps-android-${{ github.event.inputs.blender_version }}-api${{ github.event.inputs.android_api }}-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Clean dependencies build artifacts
+        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
+        run: |
+          echo "Cleaning dependencies build directory to save space..."
+          rm -rf ~/blender-git/build_deps_android
+          echo "Dependencies build directory cleaned"
+
+      - name: Verify dependencies
+        run: |
+          echo "Checking dependencies directory..."
+          ls -lah ~/blender-git/blender/lib/android_arm64/ || echo "Dependencies not found!"
+
+      - name: Build Blender
+        shell: bash
+        run: |
+          source /opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/enable
+          export CCACHE_DIR=/root/.ccache
+          export ANDROID_NDK_HOME=/opt/android-ndk-r29
+          export ANDROID_HOME=/opt/android-sdk
+
+          mkdir -p ~/blender-git/build_android_${{ github.event.inputs.build_type }}
+          cd ~/blender-git/build_android_${{ github.event.inputs.build_type }}
+
+          if [ "${{ github.event.inputs.build_type }}" == "release" ]; then
+            cmake -C ../blender/build_files/cmake/config/blender_android.cmake \
+                  -G Ninja \
+                  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+                  -DANDROID_PLATFORM=${{ github.event.inputs.android_api }} \
+                  -DANDROID_ABI=arm64-v8a \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DWITH_LIBS_PRECOMPILED=ON \
+                  -DLIBDIR=$HOME/blender-git/blender/lib/android_arm64 \
+                  -DWITH_INSTALL_PORTABLE=ON \
+                  -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                  ../blender
+          elif [ "${{ github.event.inputs.build_type }}" == "lite" ]; then
+            cmake -C ../blender/build_files/cmake/config/blender_android.cmake \
+                  -G Ninja \
+                  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+                  -DANDROID_PLATFORM=${{ github.event.inputs.android_api }} \
+                  -DANDROID_ABI=arm64-v8a \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DWITH_LIBS_PRECOMPILED=ON \
+                  -DLIBDIR=$HOME/blender-git/blender/lib/android_arm64 \
+                  -DWITH_INSTALL_PORTABLE=ON \
+                  -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                  ../blender
+          else
+            cmake -C ../blender/build_files/cmake/config/blender_android.cmake \
+                  -G Ninja \
+                  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+                  -DANDROID_PLATFORM=${{ github.event.inputs.android_api }} \
+                  -DANDROID_ABI=arm64-v8a \
+                  -DCMAKE_BUILD_TYPE=Debug \
+                  -DWITH_LIBS_PRECOMPILED=ON \
+                  -DLIBDIR=$HOME/blender-git/blender/lib/android_arm64 \
+                  -DWITH_INSTALL_PORTABLE=ON \
+                  -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                  ../blender
+          fi
+
+          echo "Building Blender..."
+          ninja
+
+          echo "Build completed successfully!"
+          echo "ccache statistics:"
+          ccache --show-stats
+
+      - name: Save ccache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: /root/.ccache
+          key: ccache-android-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Package Blender APK
+        shell: bash
+        run: |
+          source /opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/enable
+          export CCACHE_DIR=/root/.ccache
+          export ANDROID_NDK_HOME=/opt/android-ndk-r29
+          export ANDROID_HOME=/opt/android-sdk
+          export JAVA_HOME=/usr/lib/jvm/java-1.8.0
+          ccache -C
+
+          cd ~/blender-git/build_android_${{ github.event.inputs.build_type }}
+
+          echo "Packaging Blender..."
+          cpack
+
+          # If cpack didn't produce an APK, create one manually
+          APK_NAME="blender-${{ github.event.inputs.blender_version }}-android-arm64-api${{ github.event.inputs.android_api }}"
+
+          if [ ! -f "${APK_NAME}.apk" ] && [ ! -f "*.apk" ]; then
+            echo "cpack did not produce APK, creating manually..."
+
+            STAGING_DIR=$(mktemp -d)
+            mkdir -p "$STAGING_DIR/lib/arm64-v8a"
+
+            # Copy the built native library
+            SO_FILE=$(find . -name "blender.so" -o -name "libblender.so" | head -1)
+            if [ -n "$SO_FILE" ]; then
+              cp "$SO_FILE" "$STAGING_DIR/lib/arm64-v8a/libblender.so"
+            else
+              # Try to find the built binary and treat it as the native lib
+              find . -maxdepth 3 -type f -executable -name "blender" | head -1 | \
+                xargs -I{} cp "{}" "$STAGING_DIR/lib/arm64-v8a/libblender.so"
+            fi
+
+            # Copy Blender data files if present
+            DATA_DIR=$(find . -path "*/bin/*" -name "*.blend" | head -1 | xargs dirname || true)
+            if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+              mkdir -p "$STAGING_DIR/assets"
+              cp -r "$DATA_DIR"/datafiles "$STAGING_DIR/assets/" || true
+              cp -r "$DATA_DIR"/scripts "$STAGING_DIR/assets/" || true
+            fi
+
+            # Create AndroidManifest.xml for NativeActivity
+            cat > "$STAGING_DIR/AndroidManifest.xml" << MANIFEST_EOF
+            <?xml version="1.0" encoding="utf-8"?>
+            <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+                package="org.blender"
+                android:versionCode="1"
+                android:versionName="${{ github.event.inputs.blender_version }}">
+                <uses-sdk android:minSdkVersion="${{ github.event.inputs.android_api }}"
+                          android:targetSdkVersion="${{ github.event.inputs.android_api }}" />
+                <application
+                    android:label="Blender"
+                    android:hasCode="false">
+                    <activity
+                        android:name="android.app.NativeActivity"
+                        android:label="Blender"
+                        android:configChanges="orientation|screenSize|keyboard|keyboardHidden"
+                        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+                        <meta-data android:name="android.app.lib_name"
+                            android:value="blender" />
+                        <intent-filter>
+                            <action android:name="android.intent.action.MAIN" />
+                            <category android:name="android.intent.category.LAUNCHER" />
+                        </intent-filter>
+                    </activity>
+                </application>
+            </manifest>
+            MANIFEST_EOF
+
+            # Compile resources and create APK using Android SDK build tools
+            BUILD_TOOLS=$ANDROID_HOME/build-tools/34.0.0
+
+            # Compile manifest
+            $BUILD_TOOLS/aapt2 compile --dir "$STAGING_DIR" -o "$STAGING_DIR/resources.zip" || true
+
+            # Link resources
+            $BUILD_TOOLS/aapt2 link \
+              --proto-format \
+              -I $ANDROID_HOME/platforms/android-${{ github.event.inputs.android_api }}/android.jar \
+              --manifest "$STAGING_DIR/AndroidManifest.xml" \
+              -o "$STAGING_DIR/base.apk" \
+              --java "$STAGING_DIR/java" \
+              --output-text-symbols "$STAGING_DIR/R.txt" || \
+            # Fallback: create unsigned APK manually using aapt
+            $BUILD_TOOLS/aapt package \
+              -M "$STAGING_DIR/AndroidManifest.xml" \
+              -I $ANDROID_HOME/platforms/android-${{ github.event.inputs.android_api }}/android.jar \
+              -F "$STAGING_DIR/${APK_NAME}.unsigned.apk" \
+              "$STAGING_DIR"
+
+            # Add native library to APK
+            if [ -f "$STAGING_DIR/base.apk" ]; then
+              cp "$STAGING_DIR/base.apk" "$STAGING_DIR/${APK_NAME}.unsigned.apk"
+            fi
+
+            # Add files to APK
+            cd "$STAGING_DIR"
+            $BUILD_TOOLS/aapt add "$STAGING_DIR/${APK_NAME}.unsigned.apk" \
+              lib/arm64-v8a/libblender.so || true
+
+            # Align APK
+            zipalign -f 4 "$STAGING_DIR/${APK_NAME}.unsigned.apk" "$STAGING_DIR/${APK_NAME}.aligned.apk" || \
+            cp "$STAGING_DIR/${APK_NAME}.unsigned.apk" "$STAGING_DIR/${APK_NAME}.aligned.apk"
+
+            # Generate debug keystore if not exists
+            DEBUG_KEYSTORE=$HOME/.android/debug.keystore
+            mkdir -p $HOME/.android
+            if [ ! -f "$DEBUG_KEYSTORE" ]; then
+              keytool -genkeypair -v \
+                -keystore "$DEBUG_KEYSTORE" \
+                -storepass android \
+                -alias androiddebugkey \
+                -keypass android \
+                -keyalg RSA \
+                -keysize 2048 \
+                -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+
+            # Sign APK with debug key
+            apksigner sign \
+              --ks "$DEBUG_KEYSTORE" \
+              --ks-pass pass:android \
+              --key-pass pass:android \
+              --out "$STAGING_DIR/${APK_NAME}.apk" \
+              "$STAGING_DIR/${APK_NAME}.aligned.apk"
+
+            # Copy final APK to build directory
+            cp "$STAGING_DIR/${APK_NAME}.apk" ~/blender-git/build_android_${{ github.event.inputs.build_type }}/
+
+            # Cleanup staging
+            rm -rf "$STAGING_DIR"
+          fi
+
+          echo "Calculating sha256 checksums..."
+          cd ~/blender-git/build_android_${{ github.event.inputs.build_type }}
+          find . -maxdepth 1 \( -name "*.apk" -o -name "*.tar.gz" \) -type f -printf "%P\0" | \
+            xargs -0 sha256sum | sort -k2 > sha256sums.txt
+          echo "Packaging completed successfully!"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-android-arm64-${{ github.event.inputs.blender_version }}-${{ github.event.inputs.build_type }}-api${{ github.event.inputs.android_api }}
+          path: |
+            ~/blender-git/build_android_${{ github.event.inputs.build_type }}/*.apk
+            ~/blender-git/build_android_${{ github.event.inputs.build_type }}/*.tar.gz
+            ~/blender-git/build_android_${{ github.event.inputs.build_type }}/sha256sums.txt
+          retention-days: 90
+
+      - name: Notify webhook on build failure
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          if [ -z "${WEBHOOK_URL:-}" ]; then
+            echo "WEBHOOK_URL is not configured, skipping failure notification"
+            exit 0
+          fi
+
+          if ! command -v curl >/dev/null 2>&1; then
+            echo "curl is not available, skipping failure notification"
+            exit 0
+          fi
+
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          payload=$(cat <<EOF
+          {
+            "msg_type": "post",
+            "content": {
+              "post": {
+                "zh_cn": {
+                  "title": "GitHub CI Activity",
+                  "content": [
+                    [
+                      {
+                        "tag": "text",
+                        "text": "Some jobs were not successful: "
+                      },
+                      {
+                        "tag": "a",
+                        "text": "View workflow run",
+                        "href": "${RUN_URL}"
+                      }
+                    ]
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          )
+
+          curl --fail --show-error --silent -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK_URL"
+
+  draft-release:
+    if: ${{ github.event.inputs.draft_release == 'true' }}
+    needs:
+      - build
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Build release notes with checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          checksums=$(find ./artifacts -type f -name "sha256sums.txt" -exec cat {} \; -exec echo \; | awk 'NF>=2 {print $1 "  " $2}' | sort -k2,2)
+          cat <<'EOF' > release_body.md
+          ## Checksums
+
+          | Platform | Build Type | API Level |
+          |----------|-----------|-----------|
+          | Android ARM64 | ${{ github.event.inputs.build_type }} | ${{ github.event.inputs.android_api }} |
+
+          ```plaintext
+          EOF
+          printf '%s\n' "$checksums" >> release_body.md
+          printf '%s\n' '```' >> release_body.md
+
+      - name: Upload archives to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.blender_version }}-android
+          name: ${{ github.event.inputs.blender_version }} (Android ARM64)
+          draft: true
+          body_path: release_body.md
+          files: |
+            ./artifacts/**/*.apk
+            ./artifacts/**/*.tar.gz
