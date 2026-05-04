@@ -45,7 +45,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04          # 改为 x86_64 运行器
     container:
       image: rockylinux:8
       options: --privileged --user root
@@ -102,7 +102,7 @@ jobs:
           unzip -q android-ndk-r29-linux.zip
           rm android-ndk-r29-linux.zip
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
-          ls "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-arm64/bin/" | head -5
+          ls "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/" | head -5
           echo "NDK installed successfully"
 
       - name: Download and install Android SDK command-line tools
@@ -539,7 +539,7 @@ jobs:
     if: ${{ github.event.inputs.draft_release == 'true' }}
     needs:
       - build
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04          # 同样改为 x86_64
 
     steps:
       - name: Download build artifacts
