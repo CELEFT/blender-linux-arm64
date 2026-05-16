@@ -6,7 +6,7 @@ on:
       blender_version:
         description: 'Blender version tag'
         required: true
-        default: 'v5.1.1'
+        default: 'v5.0.1'
       build_type:
         description: 'Build type'
         required: true
@@ -69,6 +69,7 @@ jobs:
           retry 10 15 dnf install -y git git-lfs gcc-toolset-${{ github.event.inputs.gcc_version }} ccache
 
           # Fix sudo PAM issue: create a sudo wrapper that bypasses password and PAM authentication
+          # Since the container has the root user already, simply let sudo execute commands directly
           mv /usr/bin/sudo /usr/bin/sudo.orig || true
           cat > /usr/bin/sudo << 'EOF'
           #!/bin/bash
@@ -113,6 +114,22 @@ jobs:
             echo "No patches directory found for ${{ github.event.inputs.blender_version }}, skipping..."
           fi
 
+      # ================================================================
+      # [修复] ARM64 上跳过 ROCm/AMDGPU x86_64 不兼容包
+      # 原始 linux_rocky8_setup.sh 硬编码了 x86_64 的 AMD ROCm 仓库
+      # 在 aarch64 上会导致 dnf 安装失败，重试 10 次后报错退出
+      # ================================================================
+      - name: Patch setup script for ARM64
+        shell: bash
+        run: |
+          SETUP_SCRIPT=~/blender-git/blender/build_files/build_environment/linux/linux_rocky8_setup.sh
+          if [ "$(uname -m)" = "aarch64" ]; then
+            echo "Patching setup script to skip ROCm on aarch64..."
+            # 将安装 ROCm/HIP/AMDGPU 包的 dnf install 行注释为 echo
+            sed -i '/^dnf.*install.*\(hipcc\|hip-devel\|rocm\|ROCm\|amdgpu\)/{s/^/echo "SKIP_ARM64: " \&\& #/}' "$SETUP_SCRIPT"
+            echo "Patch applied"
+          fi
+
       - name: Install build dependencies
         shell: bash
         run: |
@@ -139,9 +156,8 @@ jobs:
           echo "Cleaning dnf cache..."
           dnf clean all
 
-      # 注意：使用 cache/restore 替代 cache，避免与后续手动 save 冲突
-      - name: Restore Blender dependencies cache
-        uses: actions/cache/restore@v4
+      - name: Cache Blender dependencies
+        uses: actions/cache@v5
         id: cache-deps
         with:
           path: ~/blender-git/blender/lib/linux_arm64
@@ -150,7 +166,7 @@ jobs:
             blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /root/.ccache
           key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -160,14 +176,13 @@ jobs:
       - name: Configure ccache
         run: |
           export CCACHE_DIR=/root/.ccache
-          # Blender 项目庞大，2G 严重不足，建议 20G 起步
-          ccache --max-size=20G
+          ccache --max-size=2G
           ccache --show-config
           ccache --zero-stats
           ccache --show-stats
 
       - name: Build dependencies
-        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == 'true'
+        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
         shell: bash
         run: |
           retry() {
@@ -205,14 +220,14 @@ jobs:
           unset CC CXX
 
       - name: Save Blender dependencies cache
-        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == 'true'
-        uses: actions/cache/save@v4
+        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
+        uses: actions/cache/save@v5
         with:
           path: ~/blender-git/blender/lib/linux_arm64
           key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v1
 
       - name: Clean dependencies build artifacts
-        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == 'true'
+        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
         run: |
           echo "Cleaning dependencies build directory to save space..."
           rm -rf ~/blender-git/build_linux
@@ -222,6 +237,22 @@ jobs:
         run: |
           echo "Checking dependencies directory..."
           ls -lah ~/blender-git/blender/lib/linux_arm64/ || echo "Dependencies not found!"
+
+      # ================================================================
+      # [修复] 4GB RAM 下防止链接 OOM
+      # Blender 的 ninja 链接阶段（blender/cycles 等目标）
+      # 需要 6-12GB 内存，4GB 会触发 OOM killer
+      # 创建 12GB swap 并限制并行度
+      # ================================================================
+      - name: Create swap space
+        shell: bash
+        run: |
+          echo "Creating 12GB swap file to prevent OOM during linking..."
+          fallocate -l 12G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=12288
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          free -h
 
       - name: Build Blender
         shell: bash
@@ -248,6 +279,9 @@ jobs:
                   -DCPACK_SOURCE_TZ=OFF \
                   -DCMAKE_C_COMPILER_LAUNCHER=ccache \
                   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                  -DCMAKE_JOB_POOLS:STRING=compile=2,link=1 \
+                  -DCMAKE_JOB_POOL_COMPILE:STRING=compile \
+                  -DCMAKE_JOB_POOL_LINK:STRING=link \
                   ../blender
           elif [ "${{ github.event.inputs.build_type }}" == "lite" ]; then
             cmake -C ../blender/build_files/cmake/config/blender_lite.cmake \
@@ -265,6 +299,9 @@ jobs:
                   -DCPACK_SOURCE_TZ=OFF \
                   -DCMAKE_C_COMPILER_LAUNCHER=ccache \
                   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                  -DCMAKE_JOB_POOLS:STRING=compile=2,link=1 \
+                  -DCMAKE_JOB_POOL_COMPILE:STRING=compile \
+                  -DCMAKE_JOB_POOL_LINK:STRING=link \
                   ../blender
           else
             cmake -G Ninja \
@@ -281,18 +318,21 @@ jobs:
                   -DCPACK_SOURCE_TZ=OFF \
                   -DCMAKE_C_COMPILER_LAUNCHER=ccache \
                   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                  -DCMAKE_JOB_POOLS:STRING=compile=2,link=1 \
+                  -DCMAKE_JOB_POOL_COMPILE:STRING=compile \
+                  -DCMAKE_JOB_POOL_LINK:STRING=link \
                   ../blender
           fi
 
-          echo "Building Blender..."
-          ninja
+          echo "Building Blender with ninja -j2 (limited due to 4GB RAM)..."
+          ninja -j2
           
           echo "Build completed successfully!"
           echo "ccache statistics:"
           ccache --show-stats
 
       - name: Save ccache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         if: always()
         with:
           path: /root/.ccache
@@ -302,6 +342,8 @@ jobs:
         shell: bash
         run: |
           source /opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/enable
+          export CCACHE_DIR=/root/.ccache
+          ccache -C
           cd ~/blender-git/build_linux_${{ github.event.inputs.build_type }}
           echo "Packaging Blender..."
           cpack
@@ -310,7 +352,7 @@ jobs:
           echo "Packaging completed successfully!"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: blender-linux-arm64-${{ github.event.inputs.blender_version }}-${{ github.event.inputs.build_type }}
           path: |
@@ -319,7 +361,7 @@ jobs:
           retention-days: 90
 
       - name: Notify webhook on build failure
-        if: failure()
+        if: ${{ failure() }}
         shell: bash
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
@@ -365,18 +407,16 @@ jobs:
           curl --fail --show-error --silent -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK_URL"
 
   draft-release:
-    if: github.event.inputs.draft_release == 'true'
+    if: ${{ github.event.inputs.draft_release == 'true' }}
     needs:
       - build
     runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
-          pattern: blender-linux-arm64-*
-          merge-multiple: true
 
       - name: Build release notes with checksums
         shell: bash
@@ -391,7 +431,7 @@ jobs:
           printf '%s\n' '```' >> release_body.md
 
       - name: Upload archives to draft release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.blender_version }}
           name: ${{ github.event.inputs.blender_version }}
