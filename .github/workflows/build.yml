@@ -141,7 +141,7 @@ jobs:
           dnf clean all
 
       - name: Cache Blender dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         id: cache-deps
         with:
           path: ~/blender-git/blender/lib/linux_arm64
@@ -150,7 +150,7 @@ jobs:
             blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: /root/.ccache
           key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -205,7 +205,7 @@ jobs:
 
       - name: Save Blender dependencies cache
         if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ~/blender-git/blender/lib/linux_arm64
           key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v1
@@ -291,7 +291,7 @@ jobs:
           ccache --show-stats
 
       - name: Save ccache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         if: always()
         with:
           path: /root/.ccache
@@ -311,7 +311,7 @@ jobs:
           echo "Packaging completed successfully!"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: blender-linux-arm64-${{ github.event.inputs.blender_version }}-${{ github.event.inputs.build_type }}
           path: |
@@ -373,7 +373,7 @@ jobs:
 
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
 
@@ -390,7 +390,7 @@ jobs:
           printf '%s\n' '```' >> release_body.md
 
       - name: Upload archives to draft release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.blender_version }}
           name: ${{ github.event.inputs.blender_version }}
