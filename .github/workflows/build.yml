@@ -6,7 +6,7 @@ on:
       blender_version:
         description: 'Blender version tag'
         required: true
-        default: 'v5.1.1'
+        default: 'v5.0.1'
       build_type:
         description: 'Build type'
         required: true
