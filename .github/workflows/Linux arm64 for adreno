@@ -1,0 +1,640 @@
+
+name: Build Blender Linux ARM64 (Debian 13)
+
+on:
+  workflow_dispatch:
+    inputs:
+      blender_ref:
+        description: "Blender Git tag or branch"
+        required: true
+        default: "v5.2.3"
+        type: string
+
+      build_jobs:
+        description: "Parallel compilation jobs"
+        required: true
+        default: "4"
+        type: string
+
+      publish_release:
+        description: "Publish GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: blender-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build Debian 13 ARM64
+    runs-on: ubuntu-26.04-arm
+
+    # GitHub ARM64 runner runs a Debian 13 ARM64 container.
+    container:
+      image: debian:trixie
+
+    timeout-minutes: 360
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      SOURCE_DIR: ${{ github.workspace }}/blender
+      BUILD_DIR: ${{ github.workspace }}/build_linux
+      DIST_DIR: ${{ github.workspace }}/dist
+
+    steps:
+
+      # --------------------------------------------------
+      # 1. Check architecture
+      # --------------------------------------------------
+
+      - name: Check runner and container
+        shell: bash
+        run: |
+          set -eux
+
+          echo "=== Host/container architecture ==="
+          uname -a
+          uname -m
+          dpkg --print-architecture
+
+          test "$(uname -m)" = "aarch64"
+          test "$(dpkg --print-architecture)" = "arm64"
+
+          echo "=== Operating system ==="
+          cat /etc/os-release
+
+          grep -q "VERSION_CODENAME=trixie" /etc/os-release
+
+      # --------------------------------------------------
+      # 2. Install build dependencies
+      # --------------------------------------------------
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -eux
+
+          apt-get update
+
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            gcc \
+            g++ \
+            gfortran \
+            make \
+            cmake \
+            ninja-build \
+            git \
+            git-lfs \
+            subversion \
+            python3 \
+            python3-dev \
+            python3-pip \
+            pkg-config \
+            ccache \
+            zstd \
+            xz-utils \
+            file \
+            binutils \
+            patchelf \
+            ca-certificates \
+            curl \
+            wget \
+            \
+            libx11-dev \
+            libxxf86vm-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libegl-dev \
+            libgl-dev \
+            libepoxy-dev \
+            libvulkan-dev \
+            \
+            libwayland-dev \
+            wayland-protocols \
+            libxkbcommon-dev \
+            libdbus-1-dev \
+            libdecor-0-dev \
+            linux-libc-dev
+
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+
+      # --------------------------------------------------
+      # 3. Check compiler
+      # --------------------------------------------------
+
+      - name: Check GCC and CMake
+        shell: bash
+        run: |
+          set -eux
+
+          gcc --version
+          g++ --version
+          cmake --version
+          python3 --version
+          git --version
+          ccache --version
+
+          GCC_VERSION="$(gcc -dumpfullversion -dumpversion)"
+
+          dpkg --compare-versions \
+            "$GCC_VERSION" ge "14.0"
+
+          echo "GCC_VERSION=$GCC_VERSION" >> "$GITHUB_ENV"
+
+      # --------------------------------------------------
+      # 4. Prepare build settings
+      # --------------------------------------------------
+
+      - name: Validate build settings
+        shell: bash
+        env:
+          BLENDER_REF: ${{ inputs.blender_ref }}
+          BUILD_JOBS: ${{ inputs.build_jobs }}
+        run: |
+          set -eux
+
+          if [[ ! "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid build_jobs"
+            exit 1
+          fi
+
+          if (( BUILD_JOBS > 8 )); then
+            echo "Maximum build_jobs is 8"
+            exit 1
+          fi
+
+          if [[ -z "$BLENDER_REF" ]]; then
+            echo "Blender ref cannot be empty"
+            exit 1
+          fi
+
+          echo "BLENDER_REF=$BLENDER_REF" >> "$GITHUB_ENV"
+          echo "BUILD_JOBS=$BUILD_JOBS" >> "$GITHUB_ENV"
+
+          mkdir -p "$DIST_DIR"
+
+      # --------------------------------------------------
+      # 5. Clone Blender
+      # --------------------------------------------------
+
+      - name: Clone Blender source
+        shell: bash
+        run: |
+          set -eux
+
+          git lfs install --system
+
+          git clone \
+            --depth 1 \
+            --branch "$BLENDER_REF" \
+            https://projects.blender.org/blender/blender.git \
+            "$SOURCE_DIR"
+
+          cd "$SOURCE_DIR"
+
+          git lfs pull
+
+          echo "=== Blender revision ==="
+          git describe --tags --always
+          git rev-parse HEAD
+
+          echo "BLENDER_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      # --------------------------------------------------
+      # 6. Download dependencies
+      # --------------------------------------------------
+
+      - name: Update Blender dependencies
+        shell: bash
+        working-directory: ${{ github.workspace }}/blender
+        run: |
+          set -eux
+
+          make update
+
+          echo "=== ARM64 dependency directory ==="
+
+          test -d lib/linux_arm64
+
+          du -sh lib/linux_arm64
+
+          ls -lah lib/linux_arm64 | head -50
+
+      # --------------------------------------------------
+      # 7. Check ARM64 dependency baseline
+      # --------------------------------------------------
+
+      - name: Verify ARM64 dependency checkout
+        shell: bash
+        working-directory: ${{ github.workspace }}/blender
+        run: |
+          set -eux
+
+          echo "Checking official ARM64 dependencies"
+
+          test -d lib/linux_arm64
+
+          find lib/linux_arm64 \
+            -maxdepth 2 \
+            -type f \
+            | head -100
+
+      # --------------------------------------------------
+      # 8. Build Blender
+      # --------------------------------------------------
+
+      - name: Build Blender
+        shell: bash
+        working-directory: ${{ github.workspace }}/blender
+        run: |
+          set -eux
+
+          echo "=== Build configuration ==="
+          echo "Architecture: $(uname -m)"
+          echo "Compiler: $(gcc --version | head -1)"
+          echo "Jobs: $BUILD_JOBS"
+
+          # Blender default target:
+          # Full available features, except CUDA and OptiX.
+
+          CC=gcc CXX=g++ \
+            make -j"$BUILD_JOBS"
+
+      # --------------------------------------------------
+      # 9. Check build configuration
+      # --------------------------------------------------
+
+      - name: Inspect CMake configuration
+        shell: bash
+        run: |
+          set -eux
+
+          test -f "$BUILD_DIR/CMakeCache.txt"
+
+          grep -E \
+            '^(CMAKE_BUILD_TYPE|CMAKE_C_COMPILER:FILEPATH|CMAKE_CXX_COMPILER:FILEPATH|WITH_INSTALL_PORTABLE|WITH_CYCLES|WITH_OPENIMAGEDENOISE|WITH_EMBREE|WITH_CODEC_FFMPEG|WITH_OPENVDB|WITH_USD|WITH_ALEMBIC|WITH_OPENSUBDIV|WITH_OPENGL_BACKEND|WITH_VULKAN_BACKEND):' \
+            "$BUILD_DIR/CMakeCache.txt" \
+            > "$DIST_DIR/build-options.txt" || true
+
+          cat "$DIST_DIR/build-options.txt"
+
+      # --------------------------------------------------
+      # 10. Install portable Blender
+      # --------------------------------------------------
+
+      - name: Install portable Blender
+        shell: bash
+        run: |
+          set -eux
+
+          VERSION="${BLENDER_REF#v}"
+          PACKAGE_NAME="blender-${VERSION}-linux-arm64-debian13"
+
+          STAGE_ROOT="$GITHUB_WORKSPACE/stage"
+          STAGE_DIR="$STAGE_ROOT/$PACKAGE_NAME"
+
+          mkdir -p "$STAGE_DIR"
+
+          # Install the complete portable application.
+          cmake --install "$BUILD_DIR" \
+            --prefix "$STAGE_DIR"
+
+          test -x "$STAGE_DIR/blender"
+
+          echo "PACKAGE_NAME=$PACKAGE_NAME" >> "$GITHUB_ENV"
+          echo "STAGE_DIR=$STAGE_DIR" >> "$GITHUB_ENV"
+
+          echo "=== Installed files ==="
+          du -sh "$STAGE_DIR"
+          find "$STAGE_DIR" -maxdepth 2 -type d
+
+      # --------------------------------------------------
+      # 11. Add launcher
+      # --------------------------------------------------
+
+      - name: Create launcher and build information
+        shell: bash
+        run: |
+          set -eux
+
+          cat > "$STAGE_DIR/run-blender.sh" <<'EOF'
+          #!/bin/sh
+
+          HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+          exec "$HERE/blender" "$@"
+          EOF
+
+          chmod +x "$STAGE_DIR/run-blender.sh"
+
+          cat > "$STAGE_DIR/BUILD-INFO.txt" <<EOF
+          Blender version: ${BLENDER_REF}
+          Blender commit: ${BLENDER_COMMIT}
+
+          Target operating system: Debian 13 Trixie
+          Target architecture: Linux ARM64 / AArch64
+
+          Compiler: GCC ${GCC_VERSION}
+
+          Build type: Blender default full build
+          CPU rendering: Cycles CPU
+          CUDA: Not included
+          OptiX: Not included
+
+          Dependencies:
+          Blender official Linux ARM64 precompiled libraries
+
+          Build runner:
+          GitHub Actions Ubuntu 26.04 ARM64
+
+          Build container:
+          Debian 13 ARM64
+          EOF
+
+          cat > "$STAGE_DIR/README-RUNTIME.txt" <<'EOF'
+          Blender Linux ARM64 portable build
+
+          Target:
+            Debian 13 Trixie
+            AArch64 / ARM64
+
+          Start:
+            ./run-blender.sh
+
+          Background:
+            ./blender -b --python-expr "import bpy; print(bpy.app.version_string)"
+
+          CPU rendering:
+            Cycles CPU
+
+          Notes:
+            This package includes Blender's portable installation
+            and bundled libraries installed by CMake.
+
+            It is not a fully static executable.
+            Host system runtime libraries and graphics drivers
+            may still be required.
+
+            CUDA and NVIDIA OptiX are not included.
+            Eevee and Vulkan depend on the target GPU driver.
+          EOF
+
+      # --------------------------------------------------
+      # 12. Verify architecture and shared libraries
+      # --------------------------------------------------
+
+      - name: Verify installed binary
+        shell: bash
+        run: |
+          set -eux
+
+          BLENDER="$STAGE_DIR/blender"
+
+          file "$BLENDER"
+
+          readelf -h "$BLENDER" | grep -E \
+            'Class|Machine'
+
+          readelf -d "$BLENDER" | grep -E \
+            'RPATH|RUNPATH' || true
+
+          "$BLENDER" --version
+
+          ldd "$BLENDER" | tee "$STAGE_DIR/ldd.txt"
+
+          if grep -q "not found" "$STAGE_DIR/ldd.txt"; then
+            echo "Missing runtime shared library"
+            exit 1
+          fi
+
+      # --------------------------------------------------
+      # 13. Verify Blender features
+      # --------------------------------------------------
+
+      - name: Test Blender features
+        shell: bash
+        run: |
+          set -eux
+
+          cat > /tmp/check_features.py <<'PY'
+          import bpy
+
+          print("Blender:", bpy.app.version_string)
+          print("Architecture build:", bpy.app.build_platform)
+
+          options = bpy.app.build_options
+
+          features = [
+              "cycles",
+              "openimagedenoise",
+              "ffmpeg",
+              "openvdb",
+              "usd",
+              "alembic",
+              "opensubdiv",
+              "opengl",
+              "vulkan",
+          ]
+
+          print("\n=== Build features ===")
+
+          for name in features:
+              print(name, getattr(options, name, "unknown"))
+
+          if not getattr(options, "cycles", False):
+              raise RuntimeError("Cycles is not enabled")
+
+          print("\nFEATURE CHECK PASSED")
+          PY
+
+          "$STAGE_DIR/blender" \
+            -b \
+            --factory-startup \
+            --python /tmp/check_features.py
+
+      # --------------------------------------------------
+      # 14. Test CPU rendering
+      # --------------------------------------------------
+
+      - name: Test Cycles CPU rendering
+        shell: bash
+        run: |
+          set -eux
+
+          cat > /tmp/test_cpu_render.py <<'PY'
+          import bpy
+          import math
+
+          scene = bpy.context.scene
+
+          # Clean the default scene.
+          bpy.ops.object.select_all(action='SELECT')
+          bpy.ops.object.delete(use_global=False)
+
+          # Cube.
+          bpy.ops.mesh.primitive_cube_add(
+              size=2,
+              location=(0, 0, 0)
+          )
+
+          # Camera.
+          camera_data = bpy.data.cameras.new("TestCamera")
+          camera = bpy.data.objects.new(
+              "TestCamera",
+              camera_data
+          )
+
+          scene.collection.objects.link(camera)
+
+          camera.location = (4, -4, 3)
+          camera.rotation_euler = (
+              math.radians(63),
+              0,
+              math.radians(45)
+          )
+
+          scene.camera = camera
+
+          # Light.
+          light_data = bpy.data.lights.new(
+              name="TestLight",
+              type='AREA'
+          )
+
+          light = bpy.data.objects.new(
+              "TestLight",
+              light_data
+          )
+
+          scene.collection.objects.link(light)
+          light.location = (2, -3, 5)
+          light_data.energy = 500
+
+          # CPU rendering.
+          scene.render.engine = 'CYCLES'
+          scene.cycles.device = 'CPU'
+          scene.cycles.samples = 8
+
+          scene.render.resolution_x = 320
+          scene.render.resolution_y = 240
+          scene.render.resolution_percentage = 100
+
+          scene.render.filepath = "/tmp/blender-arm64-test.png"
+
+          bpy.ops.render.render(write_still=True)
+
+          print("CYCLES CPU RENDER PASSED")
+          PY
+
+          "$STAGE_DIR/blender" \
+            -b \
+            --factory-startup \
+            --python /tmp/test_cpu_render.py
+
+          test -s /tmp/blender-arm64-test.png
+
+          file /tmp/blender-arm64-test.png
+
+      # --------------------------------------------------
+      # 15. Package portable Blender
+      # --------------------------------------------------
+
+      - name: Package Blender
+        shell: bash
+        run: |
+          set -eux
+
+          mkdir -p "$DIST_DIR"
+
+          tar \
+            --zstd \
+            -cf "$DIST_DIR/${PACKAGE_NAME}.tar.zst" \
+            -C "$GITHUB_WORKSPACE/stage" \
+            "$PACKAGE_NAME"
+
+          (
+            cd "$DIST_DIR"
+            sha256sum "${PACKAGE_NAME}.tar.zst" \
+              > SHA256SUMS
+          )
+
+          echo "=== Package size ==="
+          du -h "$DIST_DIR"/*
+
+          echo "=== SHA256 ==="
+          cat "$DIST_DIR/SHA256SUMS"
+
+      # --------------------------------------------------
+      # 16. Upload GitHub Actions artifact
+      # --------------------------------------------------
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-${{ inputs.blender_ref }}-linux-arm64-debian13
+          path: |
+            dist/*.tar.zst
+            dist/SHA256SUMS
+            dist/build-options.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      # --------------------------------------------------
+      # 17. Publish GitHub Release
+      # --------------------------------------------------
+
+      - name: Publish GitHub Release
+        if: inputs.publish_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: blender-${{ inputs.blender_ref }}-debian13-arm64
+          name: Blender ${{ inputs.blender_ref }} Linux ARM64 Debian 13
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.zst
+            dist/SHA256SUMS
+          body: |
+            # Blender Linux ARM64 - Debian 13
+
+            Custom Blender build for ARM64 Linux.
+
+            - Target: Debian 13 Trixie
+            - Architecture: AArch64
+            - CPU rendering: Cycles CPU
+            - CUDA: Disabled / not included
+            - NVIDIA OptiX: Disabled / not included
+
+            Built with Blender official Linux ARM64 dependencies.
+
+            This is a community build, not an official Blender release.
+
+            Check SHA256SUMS before extracting.
+
+      # --------------------------------------------------
+      # 18. Preserve logs when build fails
+      # --------------------------------------------------
+
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-arm64-build-diagnostics
+          path: |
+            build_linux/CMakeCache.txt
+            build_linux/CMakeFiles/CMakeError.log
+            build_linux/CMakeFiles/CMakeOutput.log
+            blender/build_files
+          if-no-files-found: ignore
+          retention-days: 7
