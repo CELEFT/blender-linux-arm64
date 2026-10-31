@@ -234,16 +234,16 @@ jobs:
           fi
 
           cat > "$SITECUSTOMIZE" <<'PYEOF'
-import hashlib
+          import hashlib
 
-_original_md5 = hashlib.md5
+          _original_md5 = hashlib.md5
 
-def md5(*args, **kwargs):
-    kwargs.setdefault("usedforsecurity", False)
-    return _original_md5(*args, **kwargs)
+          def md5(*args, **kwargs):
+              kwargs.setdefault("usedforsecurity", False)
+              return _original_md5(*args, **kwargs)
 
-hashlib.md5 = md5
-PYEOF
+          hashlib.md5 = md5
+          PYEOF
 
           echo "--- sitecustomize.py ---"
           cat "$SITECUSTOMIZE"
