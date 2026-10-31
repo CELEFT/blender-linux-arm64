@@ -36,6 +36,7 @@ jobs:
       BUILD_DIR: ${{ github.workspace }}/build_linux
       DIST_DIR: ${{ github.workspace }}/dist
       STAGE_DIR: ${{ github.workspace }}/stage
+      PKG_DIR: ${{ github.workspace }}/build_linux/deps_arm64/packages
 
     steps:
       # --------------------------------------------------
@@ -199,7 +200,72 @@ jobs:
           git log -1 --oneline
 
       # --------------------------------------------------
-      # 8. Build Blender dependencies
+      # 8. Cache Dependencies Packages
+      # --------------------------------------------------
+      - name: Cache Blender Dependencies Packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PKG_DIR }}
+          key: ${{ runner.os }}-${{ runner.arch }}-blender-deps-packages-${{ env.BLENDER_TAG }}
+
+      # --------------------------------------------------
+      # 9. Pre-download Dependencies with Retry
+      # --------------------------------------------------
+      - name: Pre-download dependencies with retry
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$SOURCE_DIR"
+          
+          python3 << 'PYEOF'
+          import re, os, subprocess, sys, time
+
+          versions_file = "build_files/build_environment/cmake/versions.cmake"
+          pkg_dir = os.environ.get("PKG_DIR")
+          os.makedirs(pkg_dir, exist_ok=True)
+
+          with open(versions_file) as f:
+              content = f.read()
+
+          versions = dict(re.findall(r'set\((\w+)_VERSION\s+([^\)]+)\)', content))
+          uris = re.findall(r'set\((\w+)_URI\s+([^\)]+)\)', content)
+          files = dict(re.findall(r'set\((\w+)_FILE\s+([^\)]+)\)', content))
+
+          def download(url, dest):
+              if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                  print(f"Already exists: {os.path.basename(dest)}")
+                  return
+              print(f"Downloading {url} -> {dest}")
+              retries = 5
+              for i in range(retries):
+                  try:
+                      subprocess.run(["curl", "-L", "--connect-timeout", "15", "--retry", "3", "-s", "-o", dest, url], check=True)
+                      if os.path.getsize(dest) > 0:
+                          print(f"Success: {os.path.basename(dest)}")
+                          return
+                  except subprocess.CalledProcessError:
+                      print(f"Attempt {i+1} failed for {url}, retrying in 5s...")
+                      time.sleep(5)
+              print(f"ERROR: Failed to download {url} after {retries} attempts.")
+              sys.exit(1)
+
+          for name, uri in uris:
+              if name not in files:
+                  continue
+              final_uri = uri
+              final_file = files[name]
+              for var_name, var_val in versions.items():
+                  final_uri = final_uri.replace("${" + var_name + "}", var_val)
+                  final_file = final_file.replace("${" + var_name + "}", var_val)
+              
+              dest = os.path.join(pkg_dir, final_file)
+              download(final_uri, dest)
+              
+          print("All dependencies downloaded successfully.")
+          PYEOF
+
+      # --------------------------------------------------
+      # 10. Build Blender dependencies
       # --------------------------------------------------
       - name: Build Blender Dependencies
         shell: bash
@@ -207,12 +273,11 @@ jobs:
           set -euxo pipefail
           cd "$SOURCE_DIR"
           
-          # 使用 Blender 自带的脚本构建所有依赖 (ISPC, GMP, Python, OpenImageDenoise 等)
-          # 这会调用之前我们修复过的 Python 环境来校验哈希
-          make deps -j"$BUILD_JOBS"
+          # 显式指定 PACKAGE_DIR，使 CMake 优先从我们预下载的本地目录读取
+          make deps -j"$BUILD_JOBS" ARGS="-DPACKAGE_DIR=$PKG_DIR"
 
       # --------------------------------------------------
-      # 9. Build Blender
+      # 11. Build Blender
       # --------------------------------------------------
       - name: Build Blender
         shell: bash
@@ -220,12 +285,11 @@ jobs:
           set -euxo pipefail
           cd "$SOURCE_DIR"
           
-          # 生成构建配置并开始编译
           make config
           make -j"$BUILD_JOBS"
 
       # --------------------------------------------------
-      # 10. Package Blender
+      # 12. Package Blender
       # --------------------------------------------------
       - name: Package Blender
         shell: bash
@@ -233,10 +297,8 @@ jobs:
           set -euxo pipefail
           cd "$SOURCE_DIR"
           
-          # 生成 tar.xz 压缩包
           make package
           
-          # 将生成的包复制到统一的输出目录
           mkdir -p "$DIST_DIR"
           find "$BUILD_DIR" -name "*.tar.*" -exec cp {} "$DIST_DIR/" \;
           
@@ -244,7 +306,7 @@ jobs:
           ls -lh "$DIST_DIR"
 
       # --------------------------------------------------
-      # 11. Upload Artifacts
+      # 13. Upload Artifacts
       # --------------------------------------------------
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
@@ -254,7 +316,7 @@ jobs:
           if-no-files-found: error
 
       # --------------------------------------------------
-      # 12. Publish Release (Optional)
+      # 14. Publish Release (Optional)
       # --------------------------------------------------
       - name: Publish GitHub Release
         if: ${{ inputs.publish_release }}
