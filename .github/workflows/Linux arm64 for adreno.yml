@@ -223,18 +223,32 @@ jobs:
         run: |
           set -euxo pipefail
 
-          cat > /usr/local/lib/python3.*/sitecustomize.py <<'PYEOF'
-          import hashlib
+          SITE_DIR="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
+          echo "Python site-packages: $SITE_DIR"
 
-          _original_md5 = hashlib.md5
+          SITECUSTOMIZE="$SITE_DIR/sitecustomize.py"
 
-          def md5(*args, **kwargs):
-              kwargs.setdefault("usedforsecurity", False)
-              return _original_md5(*args, **kwargs)
+          # 如果系统已有 sitecustomize，先备份，避免覆盖
+          if [ -f "$SITECUSTOMIZE" ]; then
+            cp "$SITECUSTOMIZE" "$SITECUSTOMIZE.bak"
+          fi
 
-          hashlib.md5 = md5
-          PYEOF
+          cat > "$SITECUSTOMIZE" <<'PYEOF'
+import hashlib
 
+_original_md5 = hashlib.md5
+
+def md5(*args, **kwargs):
+    kwargs.setdefault("usedforsecurity", False)
+    return _original_md5(*args, **kwargs)
+
+hashlib.md5 = md5
+PYEOF
+
+          echo "--- sitecustomize.py ---"
+          cat "$SITECUSTOMIZE"
+
+          # 验证：在新 Python 进程里调用 MD5 必须成功
           python3 -c "import hashlib; print('MD5 OK:', hashlib.md5(b'blender').hexdigest())"
 
       # --------------------------------------------------
