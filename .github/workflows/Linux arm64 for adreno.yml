@@ -26,7 +26,7 @@ jobs:
     container:
       image: debian:trixie
 
-    timeout-minutes: 360
+    timeout-minutes: 480
 
     env:
       BLENDER_TAG: v5.2.3
@@ -41,7 +41,6 @@ jobs:
       # --------------------------------------------------
       # 1. Validate parameters
       # --------------------------------------------------
-
       - name: Validate build parameters
         shell: bash
         run: |
@@ -64,7 +63,6 @@ jobs:
       # --------------------------------------------------
       # 2. Install system dependencies
       # --------------------------------------------------
-
       - name: Install system dependencies
         shell: bash
         run: |
@@ -73,151 +71,50 @@ jobs:
           apt-get update
 
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            build-essential \
-            gcc \
-            g++ \
-            cmake \
-            ninja-build \
-            make \
-            pkg-config \
-            git \
-            git-lfs \
-            subversion \
-            curl \
-            wget \
-            ca-certificates \
-            file \
-            patchelf \
-            rsync \
-            unzip \
-            zip \
-            xz-utils \
-            zstd \
-            tar \
-            bzip2 \
-            patch \
-            perl \
-            gawk \
-            m4 \
-            autoconf \
-            automake \
-            autopoint \
-            libtool \
-            gettext \
-            help2man \
-            texinfo \
-            tcl \
-            meson \
-            flex \
-            bison \
-            yasm \
-            nasm \
-            python3 \
-            python3-dev \
-            python3-venv \
-            python3-pip \
-            python3-mako \
-            python3-yaml \
-            python3-setuptools \
-            python3-wheel \
-            libssl-dev \
-            libffi-dev \
-            libxml2-dev \
-            libzstd-dev \
-            liblzma-dev \
-            libbz2-dev \
-            libreadline-dev \
-            libncurses-dev \
-            libsqlite3-dev \
-            libtinfo-dev \
-            libfontconfig1-dev \
-            libfreetype-dev \
-            libharfbuzz-dev \
-            libfribidi-dev \
-            libx11-dev \
-            libxext-dev \
-            libxrender-dev \
-            libxfixes-dev \
-            libxi-dev \
-            libxinerama-dev \
-            libxcursor-dev \
-            libxrandr-dev \
-            libxxf86vm-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            libwayland-dev \
-            wayland-protocols \
-            libegl-dev \
-            libgl-dev \
-            libglu1-mesa-dev \
-            libvulkan-dev \
-            libdrm-dev \
-            libgbm-dev \
-            libepoxy-dev \
-            libosmesa6-dev \
-            libdbus-1-dev \
-            libudev-dev \
-            libopenal-dev \
-            libpulse-dev \
-            libjack-jackd2-dev \
-            libsndfile1-dev \
-            libjpeg-dev \
-            libpng-dev \
-            libtiff-dev \
-            libwebp-dev \
-            libopenjp2-7-dev \
-            libavif-dev \
-            libtbb-dev \
-            libjemalloc-dev
+            build-essential gcc g++ cmake ninja-build make pkg-config \
+            git git-lfs subversion curl wget ca-certificates file patchelf rsync \
+            unzip zip xz-utils zstd tar bzip2 patch perl gawk m4 autoconf automake \
+            autopoint libtool gettext help2man texinfo tcl meson flex bison yasm nasm \
+            python3 python3-dev python3-venv python3-pip python3-mako python3-yaml \
+            python3-setuptools python3-wheel libssl-dev libffi-dev libxml2-dev \
+            libzstd-dev liblzma-dev libbz2-dev libreadline-dev libncurses-dev \
+            libsqlite3-dev libtinfo-dev libfontconfig1-dev libfreetype-dev \
+            libharfbuzz-dev libfribidi-dev libx11-dev libxext-dev libxrender-dev \
+            libxfixes-dev libxi-dev libxinerama-dev libxcursor-dev libxrandr-dev \
+            libxxf86vm-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            wayland-protocols libegl-dev libgl-dev libglu1-mesa-dev libvulkan-dev \
+            libdrm-dev libgbm-dev libepoxy-dev libosmesa6-dev libdbus-1-dev \
+            libudev-dev libopenal-dev libpulse-dev libjack-jackd2-dev libsndfile1-dev \
+            libjpeg-dev libpng-dev libtiff-dev libwebp-dev libopenjp2-7-dev \
+            libavif-dev libtbb-dev libjemalloc-dev
 
           git lfs install
 
       # --------------------------------------------------
       # 3. Verify environment
       # --------------------------------------------------
-
       - name: Verify ARM64 environment
         shell: bash
         run: |
           set -euxo pipefail
-
           uname -a
           dpkg --print-architecture
           gcc --version
-          g++ --version
           cmake --version
           python3 --version
-
           test "$(dpkg --print-architecture)" = "arm64"
 
       - name: Verify dependency build tools
         shell: bash
         run: |
           set -euxo pipefail
-
-          for tool in \
-            cmake \
-            ninja \
-            gcc \
-            g++ \
-            make \
-            git \
-            curl \
-            python3 \
-            tclsh \
-            autopoint \
-            help2man \
-            meson \
-            nasm \
-            yasm
-          do
+          for tool in cmake ninja gcc g++ make git curl python3 tclsh autopoint help2man meson nasm yasm; do
             command -v "$tool"
           done
 
       # --------------------------------------------------
       # 4. Fix MD5 for OpenSSL 3 (Debian 13 / trixie)
       # --------------------------------------------------
-
       - name: Fix hashlib MD5 for OpenSSL 3 strict mode
         shell: bash
         run: |
@@ -228,7 +125,6 @@ jobs:
 
           SITECUSTOMIZE="$SITE_DIR/sitecustomize.py"
 
-          # 如果系统已有 sitecustomize，先备份，避免覆盖
           if [ -f "$SITECUSTOMIZE" ]; then
             cp "$SITECUSTOMIZE" "$SITECUSTOMIZE.bak"
           fi
@@ -248,28 +144,21 @@ jobs:
           echo "--- sitecustomize.py ---"
           cat "$SITECUSTOMIZE"
 
-          # 验证：在新 Python 进程里调用 MD5 必须成功
           python3 -c "import hashlib; print('MD5 OK:', hashlib.md5(b'blender').hexdigest())"
 
       # --------------------------------------------------
       # 5. Configure Git LFS
       # --------------------------------------------------
-
       - name: Configure Git LFS
         shell: bash
         run: |
           set -euxo pipefail
-
-          git config --global \
-            url."https://projects.blender.org/".insteadOf \
-            "https://git.blender.org/"
-
+          git config --global url."https://projects.blender.org/".insteadOf "https://git.blender.org/"
           git lfs install
 
       # --------------------------------------------------
       # 6. Cache Blender source repository
       # --------------------------------------------------
-
       - name: Cache Blender source repository
         uses: actions/cache@v4
         with:
@@ -279,7 +168,6 @@ jobs:
       # --------------------------------------------------
       # 7. Checkout Blender source
       # --------------------------------------------------
-
       - name: Checkout Blender 5.2.3 source
         shell: bash
         run: |
@@ -291,7 +179,6 @@ jobs:
                 --tags \
                 --exact-match 2>/dev/null || true
             )"
-
             if [ "$CURRENT_TAG" != "$BLENDER_TAG" ]; then
               rm -rf "$SOURCE_DIR"
             fi
@@ -306,10 +193,76 @@ jobs:
           fi
 
           cd "$SOURCE_DIR"
-
           git lfs pull
-
           echo "Blender version:"
           git describe --tags --exact-match
-
           git log -1 --oneline
+
+      # --------------------------------------------------
+      # 8. Build Blender dependencies
+      # --------------------------------------------------
+      - name: Build Blender Dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$SOURCE_DIR"
+          
+          # 使用 Blender 自带的脚本构建所有依赖 (ISPC, GMP, Python, OpenImageDenoise 等)
+          # 这会调用之前我们修复过的 Python 环境来校验哈希
+          make deps -j"$BUILD_JOBS"
+
+      # --------------------------------------------------
+      # 9. Build Blender
+      # --------------------------------------------------
+      - name: Build Blender
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$SOURCE_DIR"
+          
+          # 生成构建配置并开始编译
+          make config
+          make -j"$BUILD_JOBS"
+
+      # --------------------------------------------------
+      # 10. Package Blender
+      # --------------------------------------------------
+      - name: Package Blender
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$SOURCE_DIR"
+          
+          # 生成 tar.xz 压缩包
+          make package
+          
+          # 将生成的包复制到统一的输出目录
+          mkdir -p "$DIST_DIR"
+          find "$BUILD_DIR" -name "*.tar.*" -exec cp {} "$DIST_DIR/" \;
+          
+          echo "Generated packages:"
+          ls -lh "$DIST_DIR"
+
+      # --------------------------------------------------
+      # 11. Upload Artifacts
+      # --------------------------------------------------
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-linux-arm64-package
+          path: ${{ env.DIST_DIR }}/*.tar.*
+          if-no-files-found: error
+
+      # --------------------------------------------------
+      # 12. Publish Release (Optional)
+      # --------------------------------------------------
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.BLENDER_TAG }}-arm64
+          name: Blender ${{ env.BLENDER_TAG }} (Linux ARM64)
+          body: |
+            Automated build of Blender ${{ env.BLENDER_TAG }} for Linux ARM64 (Debian 13 / trixie).
+          files: ${{ env.DIST_DIR }}/*.tar.*
+          token: ${{ secrets.GITHUB_TOKEN }}
