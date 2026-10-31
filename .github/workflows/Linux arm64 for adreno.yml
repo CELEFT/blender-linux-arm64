@@ -5,13 +5,12 @@ on:
   workflow_dispatch:
     inputs:
       build_jobs:
-        description: "Parallel build jobs (1-8)"
+        description: "Parallel build jobs"
         required: true
         default: "4"
         type: string
-
       publish_release:
-        description: "Publish GitHub Release"
+        description: "Publish the result as a GitHub Release"
         required: true
         default: false
         type: boolean
@@ -19,9 +18,13 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: blender-5.2.3-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
-    name: Blender 5.2.3 Linux ARM64
+    name: Build Blender 5.2.3 ARM64
     runs-on: ubuntu-26.04-arm
 
     container:
@@ -30,29 +33,44 @@ jobs:
     timeout-minutes: 360
 
     env:
-      DEBIAN_FRONTEND: noninteractive
       BLENDER_TAG: v5.2.3
       BUILD_JOBS: ${{ inputs.build_jobs }}
-
       SOURCE_DIR: ${{ github.workspace }}/blender
       BUILD_DIR: ${{ github.workspace }}/build_linux
       DIST_DIR: ${{ github.workspace }}/dist
       STAGE_DIR: ${{ github.workspace }}/stage
 
     steps:
+      # ------------------------------------------------------------
+      # 1. Validate build parameters
+      # ------------------------------------------------------------
 
-      # ==================================================
-      # 1. Install dependencies
-      # ==================================================
+      - name: Validate build parameters
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          if ! [[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::BUILD_JOBS must be a positive integer"
+            exit 1
+          fi
+
+          echo "Build jobs: $BUILD_JOBS"
+          echo "Blender tag: $BLENDER_TAG"
+
+      # ------------------------------------------------------------
+      # 2. Install system dependencies
+      # ------------------------------------------------------------
 
       - name: Install system dependencies
         shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
           apt-get update
 
-          apt-get install -y --no-install-recommends \
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends \
             bash \
             ca-certificates \
             curl \
@@ -72,10 +90,17 @@ jobs:
             python3-dev \
             python3-pip \
             python3-venv \
+            python3-mako \
             perl \
             patch \
             autoconf \
             automake \
+            autopoint \
+            gettext \
+            help2man \
+            texinfo \
+            tcl \
+            meson \
             libtool \
             bison \
             flex \
@@ -120,16 +145,17 @@ jobs:
           apt-get clean
           rm -rf /var/lib/apt/lists/*
 
-      # ==================================================
-      # 2. Verify environment
-      # ==================================================
+      # ------------------------------------------------------------
+      # 3. Verify architecture and toolchain
+      # ------------------------------------------------------------
 
-      - name: Verify build environment
+      - name: Verify ARM64 environment
         shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
-          echo "===== OS ====="
+          echo "===== SYSTEM ====="
+          uname -a
           cat /etc/os-release
 
           echo "===== ARCHITECTURE ====="
@@ -142,61 +168,79 @@ jobs:
           echo "===== COMPILER ====="
           gcc-14 --version
           g++-14 --version
+          gfortran-14 --version
 
-          echo "===== CMAKE ====="
+          echo "===== BUILD TOOLS ====="
           cmake --version
+          make --version
+          ninja --version
+          python3 --version
 
-          CMAKE_VERSION="$(cmake --version | head -n1 | awk '{print $3}')"
-          CMAKE_MAJOR="${CMAKE_VERSION%%.*}"
+          # Blender dependency scripts rely on legacy CMake 3.x behavior.
+          CMAKE_MAJOR="$(cmake --version | head -n1 | \
+            sed -E 's/[^0-9]*([0-9]+)\..*/\1/')"
 
           if [ "$CMAKE_MAJOR" -ge 4 ]; then
-            echo "::error::CMake 4.x detected."
-            echo "Blender 5.2.3 dependency scripts require CMake 3.x."
+            echo "::error::CMake 4.x is not suitable for this dependency build. Use CMake 3.x."
             exit 1
           fi
 
-          echo "===== DISK ====="
-          df -h
+      # ------------------------------------------------------------
+      # 4. Verify required dependency build tools
+      # ------------------------------------------------------------
 
-          echo "===== MEMORY ====="
-          free -h || true
+      - name: Verify dependency build tools
+        shell: bash
+        run: |
+          set -euxo pipefail
 
-          echo "===== BUILD JOBS ====="
-
-          case "$BUILD_JOBS" in
-            ''|*[!0-9]*)
-              echo "::error::Invalid BUILD_JOBS"
+          for tool in \
+            tclsh \
+            autopoint \
+            help2man \
+            autoconf \
+            automake \
+            gettext \
+            makeinfo \
+            flex \
+            bison \
+            libtoolize \
+            yasm \
+            ninja \
+            meson
+          do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "::error::Missing build tool: $tool"
               exit 1
-              ;;
-          esac
+            fi
 
-          test "$BUILD_JOBS" -ge 1
-          test "$BUILD_JOBS" -le 8
+            echo "[OK] $tool: $(command -v "$tool")"
+          done
 
-          echo "Build jobs: $BUILD_JOBS"
+          python3 -c \
+            "import mako; print('Mako:', mako.__version__)"
 
-      # ==================================================
-      # 3. Configure Git LFS
-      # ==================================================
+      # ------------------------------------------------------------
+      # 5. Configure Git LFS
+      # ------------------------------------------------------------
 
       - name: Configure Git LFS
         shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
+          git lfs install
+          git --version
           git lfs version
-          git lfs install --skip-repo
 
-          git config --global core.autocrlf false
+      # ------------------------------------------------------------
+      # 6. Download exact Blender source version
+      # ------------------------------------------------------------
 
-      # ==================================================
-      # 4. Clone Blender 5.2.3
-      # ==================================================
-
-      - name: Clone Blender source
+      - name: Checkout Blender 5.2.3 source
         shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
           git clone \
             --depth 1 \
@@ -206,469 +250,501 @@ jobs:
 
           cd "$SOURCE_DIR"
 
-          echo "===== GIT VERSION ====="
+          git lfs pull
 
+          echo "===== SOURCE VERSION ====="
           git describe --tags --exact-match
-          git log -1 --oneline
+          git rev-parse HEAD
 
           test "$(git describe --tags --exact-match)" = "$BLENDER_TAG"
 
-          echo "===== BLENDER VERSION HEADER ====="
+          echo "===== VERSION HEADER ====="
 
           VERSION_HEADER="source/blender/blenkernel/BKE_blender_version.h"
 
           if [ ! -f "$VERSION_HEADER" ]; then
             echo "::error::Version header not found: $VERSION_HEADER"
-
-            echo "Searching for version header:"
             find source -name '*blender*version*.h' -type f
-
             exit 1
           fi
-
-          echo "Found: $VERSION_HEADER"
 
           grep -E \
             'BLENDER_VERSION|BLENDER_VERSION_PATCH|BLENDER_VERSION_CYCLE|BLENDER_VERSION_SUFFIX' \
             "$VERSION_HEADER"
 
-          # Verify the actual source version.
-          grep -q '^#define BLENDER_VERSION 502$' "$VERSION_HEADER"
-          grep -q '^#define BLENDER_VERSION_PATCH 3$' "$VERSION_HEADER"
-          grep -q '^#define BLENDER_VERSION_CYCLE release$' "$VERSION_HEADER"
+          grep -Eq '^#define BLENDER_VERSION[[:space:]]+502$' \
+            "$VERSION_HEADER"
 
-          echo "===== GIT LFS ====="
+          grep -Eq '^#define BLENDER_VERSION_PATCH[[:space:]]+3$' \
+            "$VERSION_HEADER"
 
-          git lfs pull
+          grep -Eq '^#define BLENDER_VERSION_CYCLE[[:space:]]+release$' \
+            "$VERSION_HEADER"
 
-      # ==================================================
-      # 5. Inspect submodules
-      # ==================================================
-
-      - name: Inspect source submodules
-        shell: bash
-        run: |
-          set -eux
-
-          cd "$SOURCE_DIR"
-
-          echo "===== .gitmodules ====="
-
-          cat .gitmodules
-
-          echo "===== CONFIGURED LIBRARIES ====="
-
-          git config -f .gitmodules \
-            --get-regexp 'submodule\..*\.path' || true
-
-          echo "===== ARM64 CONFIGURATION ====="
-
-          if git config -f .gitmodules \
-            --get-regexp 'submodule\..*\.path' \
-            | awk '$2 == "lib/linux_arm64" { found=1 }
-                   END { exit !found }'
-          then
-            echo "ARM64 precompiled library submodule exists."
+          echo "===== SUBMODULE CONFIGURATION ====="
+          if [ -f .gitmodules ]; then
+            cat .gitmodules
           else
-            echo "No ARM64 precompiled library submodule."
-            echo "Will build dependencies from source."
+            echo "No .gitmodules file"
           fi
 
-      # ==================================================
-      # 6. Build dependencies
-      # ==================================================
+          echo "===== SOURCE CHECKOUT COMPLETE ====="
+
+      # ------------------------------------------------------------
+      # 7. Build ARM64 dependencies
+      # ------------------------------------------------------------
 
       - name: Build ARM64 dependencies
         shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
           cd "$SOURCE_DIR"
 
           export CC=gcc-14
           export CXX=g++-14
+          export FC=gfortran-14
+
+          export BUILD_DIR="$BUILD_DIR"
 
           echo "===== DEPENDENCY BUILD CONFIGURATION ====="
-
-          echo "Architecture: $(uname -m)"
-          echo "Compiler: $(gcc-14 --version | head -n1)"
+          echo "Source: $SOURCE_DIR"
+          echo "Build: $BUILD_DIR"
           echo "Jobs: $BUILD_JOBS"
-
-          echo "===== DEPENDENCY SOURCE ====="
-
-          test -f build_files/build_environment/CMakeLists.txt
+          echo "Architecture: $(uname -m)"
 
           echo "===== START MAKE DEPS ====="
 
+          # Do not run make update here.
+          # The v5.2.3 tag is intentionally checked out detached.
+          # Its release source does not provide a precompiled ARM64
+          # dependency submodule.
+
           make deps NPROCS="$BUILD_JOBS"
 
-          echo "===== DEPENDENCIES FINISHED ====="
+          echo "===== VERIFY DEPENDENCY INSTALLATION ====="
 
-          echo "===== EXPECTED OUTPUT ====="
+          test -d "$SOURCE_DIR/lib/linux_arm64"
 
-          test -d lib/linux_arm64
+          find "$SOURCE_DIR/lib/linux_arm64" \
+            -maxdepth 2 \
+            -type d \
+            | head -n 100
 
-          ls -lah lib/linux_arm64
+          echo "===== DEPENDENCIES BUILT ====="
 
-          echo "===== BUILT LIBRARIES ====="
+      # ------------------------------------------------------------
+      # 8. Build Blender
+      # ------------------------------------------------------------
 
-          find lib/linux_arm64 -maxdepth 2 -type d | head -n 100
-
-          echo "===== DISK AFTER DEPENDENCIES ====="
-
-          df -h
-
-      # ==================================================
-      # 7. Build Blender
-      # ==================================================
-
-      - name: Build Blender 5.2.3
+      - name: Build Blender
         shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
           cd "$SOURCE_DIR"
 
           export CC=gcc-14
           export CXX=g++-14
+          export FC=gfortran-14
+          export BUILD_DIR="$BUILD_DIR"
 
-          echo "===== BUILD BLENDER ====="
+          echo "===== BLENDER BUILD ====="
+          echo "Blender: $BLENDER_TAG"
+          echo "Architecture: ARM64"
+          echo "Compiler: GCC 14"
+          echo "Jobs: $BUILD_JOBS"
+
+          # Build the normal Blender target.
+          # Do not use the release target: it enables CUDA/OptiX.
 
           make NPROCS="$BUILD_JOBS"
 
-          echo "===== BUILD FINISHED ====="
+          echo "===== BUILD COMPLETE ====="
 
           test -x "$BUILD_DIR/bin/blender"
 
-      # ==================================================
-      # 8. Verify binary
-      # ==================================================
+          "$BUILD_DIR/bin/blender" --version
 
-      - name: Verify Blender binary
+      # ------------------------------------------------------------
+      # 9. Inspect dynamic dependencies
+      # ------------------------------------------------------------
+
+      - name: Inspect Blender runtime dependencies
         shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
           BLENDER="$BUILD_DIR/bin/blender"
 
           test -x "$BLENDER"
 
-          echo "===== FILE ====="
-
+          echo "===== ELF INFORMATION ====="
           file "$BLENDER"
+          readelf -h "$BLENDER" | head -n 30
 
-          echo "===== ELF HEADER ====="
+          echo "===== DYNAMIC DEPENDENCIES ====="
+          ldd "$BLENDER" | tee "$BUILD_DIR/ldd.txt"
 
-          readelf -h "$BLENDER"
-
-          echo "===== VERSION ====="
-
-          "$BLENDER" --version
-
-          echo "===== LINKED LIBRARIES ====="
-
-          ldd "$BLENDER" | tee "$GITHUB_WORKSPACE/ldd.txt"
-
-          if grep -q "not found" "$GITHUB_WORKSPACE/ldd.txt"; then
-            echo "::error::Missing shared libraries."
+          if grep -q "not found" "$BUILD_DIR/ldd.txt"; then
+            echo "::error::Missing shared library detected"
             exit 1
           fi
 
-      # ==================================================
-      # 9. Verify build features
-      # ==================================================
+          echo "===== BLENDER VERSION ====="
+          "$BLENDER" --version
 
-      - name: Verify Blender features
+      # ------------------------------------------------------------
+      # 10. Inspect Blender build features
+      # ------------------------------------------------------------
+
+      - name: Verify Blender build features
         shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
-          "$BUILD_DIR/bin/blender" \
-            -b \
+          BLENDER="$BUILD_DIR/bin/blender"
+
+          "$BLENDER" \
+            --background \
+            --factory-startup \
             --python-expr '
           import bpy
-          import json
+
+          print("===== BLENDER BUILD OPTIONS =====")
 
           options = bpy.app.build_options
 
-          names = [
-              "cycles",
-              "openimagedenoise",
-              "ffmpeg",
-              "openvdb",
-              "usd",
-              "alembic",
-              "opensubdiv",
-              "opengl",
-              "vulkan",
-          ]
+          for name in sorted(dir(options)):
+              if name.startswith("_"):
+                  continue
 
-          result = {}
+              try:
+                  value = getattr(options, name)
+              except Exception:
+                  continue
 
-          for name in names:
-              result[name] = getattr(options, name, None)
+              if isinstance(value, bool):
+                  print(f"{name}: {value}")
 
-          print("===== BUILD FEATURES =====")
-          print(json.dumps(result, indent=2))
-
-          print("Blender version:", bpy.app.version_string)
-          print("Blender version tuple:", bpy.app.version)
+          print("===== VERSION =====")
+          print(bpy.app.version_string)
+          print("===== PYTHON =====")
+          print(bpy.app.version)
           '
 
-      # ==================================================
-      # 10. Test Cycles CPU rendering
-      # ==================================================
+      # ------------------------------------------------------------
+      # 11. Cycles CPU rendering test
+      # ------------------------------------------------------------
 
       - name: Test Cycles CPU rendering
         shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
-          cat > /tmp/test_cycles.py <<'PY'
+          BLENDER="$BUILD_DIR/bin/blender"
+
+          cat > /tmp/cycles_test.py <<'PY'
           import bpy
-          from mathutils import Vector
+          import os
+
+          output = "/tmp/blender-cycles-test.png"
 
           bpy.ops.wm.read_factory_settings(use_empty=True)
 
           scene = bpy.context.scene
-
-          # Create cube.
-          bpy.ops.mesh.primitive_cube_add(
-              size=2,
-              location=(0, 0, 0)
-          )
-
-          # Create camera.
-          bpy.ops.object.camera_add(
-              location=(4, -6, 4)
-          )
-
-          camera = bpy.context.object
-
-          direction = Vector((0, 0, 0)) - camera.location
-
-          camera.rotation_euler = direction.to_track_quat(
-              '-Z', 'Y'
-          ).to_euler()
-
-          scene.camera = camera
-
-          # Create area light.
-          bpy.ops.object.light_add(
-              type='AREA',
-              location=(4, -4, 5)
-          )
-
-          light = bpy.context.object
-          light.data.energy = 500
-          light.data.shape = 'DISK'
-          light.data.size = 5
-
-          # Cycles CPU.
-          scene.render.engine = 'CYCLES'
-          scene.cycles.device = 'CPU'
+          scene.render.engine = "CYCLES"
+          scene.cycles.device = "CPU"
           scene.cycles.samples = 8
 
-          # Resolution.
           scene.render.resolution_x = 320
           scene.render.resolution_y = 240
           scene.render.resolution_percentage = 100
+          scene.render.image_settings.file_format = "PNG"
+          scene.render.filepath = output
 
-          # PNG output.
-          scene.render.image_settings.file_format = 'PNG'
-          scene.render.filepath = '/tmp/blender-cycles-test.png'
+          bpy.ops.mesh.primitive_cube_add(size=2)
+          cube = bpy.context.object
 
+          material = bpy.data.materials.new("TestMaterial")
+          material.diffuse_color = (0.8, 0.2, 0.1, 1.0)
+          cube.data.materials.append(material)
+
+          bpy.ops.object.camera_add(location=(4, -4, 3))
+          camera = bpy.context.object
+          camera.rotation_euler = (1.1, 0.0, 0.78)
+          scene.camera = camera
+
+          bpy.ops.object.light_add(
+              type="AREA",
+              location=(2, -3, 4)
+          )
+          light = bpy.context.object
+          light.data.energy = 500
+          light.data.shape = "DISK"
+          light.data.size = 5
+
+          print("Starting Cycles CPU render...")
           bpy.ops.render.render(write_still=True)
 
-          print("Cycles CPU render completed.")
+          assert os.path.isfile(output), "Render output missing"
+          assert os.path.getsize(output) > 0, "Render output is empty"
+
+          print("Cycles CPU render passed:", output)
           PY
 
-          "$BUILD_DIR/bin/blender" \
-            -b \
-            --python /tmp/test_cycles.py
-
-          test -s /tmp/blender-cycles-test.png
+          "$BLENDER" \
+            --background \
+            --factory-startup \
+            --python /tmp/cycles_test.py
 
           file /tmp/blender-cycles-test.png
+          ls -lh /tmp/blender-cycles-test.png
 
-      # ==================================================
-      # 11. Prepare portable package
-      # ==================================================
+      # ------------------------------------------------------------
+      # 12. Prepare portable package
+      # ------------------------------------------------------------
 
       - name: Prepare portable package
         shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
 
-          mkdir -p "$DIST_DIR"
-          mkdir -p "$STAGE_DIR"
-
-          VERSION="$(
-            "$BUILD_DIR/bin/blender" \
-              --version \
-              | head -n 1 \
-              | awk '{print $2}'
-          )"
-
-          PACKAGE_NAME="blender-${VERSION}-linux-arm64-debian13"
+          PACKAGE_NAME="blender-5.2.3-linux-arm64-debian13"
           PACKAGE_DIR="$STAGE_DIR/$PACKAGE_NAME"
 
           mkdir -p "$PACKAGE_DIR"
+          mkdir -p "$DIST_DIR"
 
-          # Copy entire Blender runtime.
+          test -d "$BUILD_DIR/bin"
+          test -x "$BUILD_DIR/bin/blender"
+
+          # Preserve Blender's complete installed directory layout,
+          # including Python modules, scripts and bundled resources.
+
           cp -a "$BUILD_DIR/bin/." "$PACKAGE_DIR/"
 
-          # Launcher.
           cat > "$PACKAGE_DIR/run-blender.sh" <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
 
-          HERE="$(cd "$(dirname "$0")" && pwd)"
-
-          exec "$HERE/blender" "$@"
+          SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          exec "$SCRIPT_DIR/blender" "$@"
           SH
 
           chmod +x "$PACKAGE_DIR/run-blender.sh"
 
-          # Build information.
           cat > "$PACKAGE_DIR/BUILD-INFO.txt" <<EOF
-          Blender version: $VERSION
-          Source tag: $BLENDER_TAG
-          Source commit: $(git -C "$SOURCE_DIR" rev-parse HEAD)
-          Architecture: ARM64
-          Build OS: Debian 13 Trixie
+          Blender version: 5.2.3
+          Blender tag: v5.2.3
+          Architecture: Linux ARM64 (aarch64)
+          Build operating system: Debian 13 Trixie
           Compiler: GCC 14
           Build jobs: $BUILD_JOBS
-          Dependencies: Built from source
-          Renderer: Cycles CPU
-          GPU: Depends on target system graphics drivers
+          Build date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Source commit: $(git -C "$SOURCE_DIR" rev-parse HEAD)
           EOF
 
-          # Runtime instructions.
           cat > "$PACKAGE_DIR/README-RUNTIME.txt" <<'EOF'
-          Blender 5.2.3 ARM64 Portable Build
+          Blender 5.2.3 for Linux ARM64
+          =============================
 
-          Target:
-            Linux ARM64
+          Target architecture:
+            AArch64 / ARM64
+
+          Build environment:
             Debian 13 Trixie
 
-          GUI:
+          Start Blender:
             ./run-blender.sh
 
           Version:
             ./run-blender.sh --version
 
-          Background:
-            ./run-blender.sh -b
+          Background rendering:
+            ./run-blender.sh --background --python your_script.py
 
-          Cycles:
-            ./run-blender.sh -b -E CYCLES
-
-          Important:
+          Runtime requirements:
             This is not a fully static binary.
-            Compatible system libraries are required.
-            GPU rendering and viewport support depend on
-            the target device's graphics drivers.
+            The target system must provide compatible system libraries.
+
+          GPU notes:
+            This build does not include CUDA or NVIDIA OptiX.
+            Eevee and other GPU features depend on the target device's
+            Linux graphics stack and compatible OpenGL/Vulkan drivers.
+
+          Cycles CPU:
+            A CPU rendering test was performed during CI.
           EOF
 
-          cp "$GITHUB_WORKSPACE/ldd.txt" "$PACKAGE_DIR/"
-
-          echo "PACKAGE_NAME=$PACKAGE_NAME" >> "$GITHUB_ENV"
-          echo "PACKAGE_DIR=$PACKAGE_DIR" >> "$GITHUB_ENV"
-
-          echo "===== PACKAGE SIZE ====="
-
-          du -sh "$PACKAGE_DIR"
+          if [ -f "$BUILD_DIR/ldd.txt" ]; then
+            cp "$BUILD_DIR/ldd.txt" "$PACKAGE_DIR/ldd.txt"
+          fi
 
           echo "===== PACKAGE CONTENTS ====="
-
+          du -sh "$PACKAGE_DIR"
           find "$PACKAGE_DIR" -maxdepth 2 -type f | head -n 100
 
-      # ==================================================
-      # 12. Create archive
-      # ==================================================
+      # ------------------------------------------------------------
+      # 13. Create compressed archive
+      # ------------------------------------------------------------
 
-      - name: Create archive
+      - name: Create tar.zst archive
         shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
+
+          PACKAGE_NAME="blender-5.2.3-linux-arm64-debian13"
+
+          cd "$STAGE_DIR"
 
           tar \
             --zstd \
             -cf "$DIST_DIR/${PACKAGE_NAME}.tar.zst" \
-            -C "$STAGE_DIR" \
             "$PACKAGE_NAME"
 
           cd "$DIST_DIR"
 
-          sha256sum \
-            "${PACKAGE_NAME}.tar.zst" \
-            > SHA256SUMS
+          sha256sum "${PACKAGE_NAME}.tar.zst" \
+            | tee "${PACKAGE_NAME}.tar.zst.sha256"
 
-          echo "===== OUTPUT ====="
+          echo "===== ARCHIVE ====="
+          ls -lh "$DIST_DIR"
 
-          ls -lh
+          zstd -t "${PACKAGE_NAME}.tar.zst"
 
-          echo "===== SHA256 ====="
+      # ------------------------------------------------------------
+      # 14. Upload GitHub Actions artifact
+      # ------------------------------------------------------------
 
-          cat SHA256SUMS
-
-      # ==================================================
-      # 13. Upload artifact
-      # ==================================================
-
-      - name: Upload artifact
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: blender-5.2.3-linux-arm64-debian13
           path: |
-            dist/*.tar.zst
-            dist/SHA256SUMS
+            dist/blender-5.2.3-linux-arm64-debian13.tar.zst
+            dist/blender-5.2.3-linux-arm64-debian13.tar.zst.sha256
           if-no-files-found: error
           compression-level: 0
-          retention-days: 30
+          retention-days: 14
 
-      # ==================================================
-      # 14. Optional GitHub Release
-      # ==================================================
+      # ------------------------------------------------------------
+      # 15. Optional GitHub Release
+      # ------------------------------------------------------------
 
       - name: Publish GitHub Release
         if: ${{ inputs.publish_release }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: blender-5.2.3-arm64-${{ github.run_number }}
-          name: Blender 5.2.3 ARM64 Debian 13
+          tag_name: blender-5.2.3-linux-arm64-debian13
+          name: Blender 5.2.3 Linux ARM64 (Debian 13)
           body: |
-            Custom Blender 5.2.3 ARM64 build.
+            Blender 5.2.3 built from the official v5.2.3 source tag.
 
-            Source: v5.2.3
-            Architecture: ARM64
-            Build OS: Debian 13 Trixie
-            Dependencies: Built from source
-            Renderer: Cycles CPU
+            Target:
+            - Linux ARM64 / AArch64
+            - Debian 13 Trixie build environment
+            - GCC 14
+            - Cycles CPU rendering tested
 
-            This is not an official Blender binary.
+            GPU acceleration depends on the target device's Linux
+            graphics driver and OpenGL/Vulkan support.
+
+            This package is not fully static and requires compatible
+            runtime system libraries.
+
           files: |
-            dist/*.tar.zst
-            dist/SHA256SUMS
+            dist/blender-5.2.3-linux-arm64-debian13.tar.zst
+            dist/blender-5.2.3-linux-arm64-debian13.tar.zst.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: false
 
-      # ==================================================
-      # 15. Upload diagnostics on failure
-      # ==================================================
+      # ------------------------------------------------------------
+      # 16. Collect diagnostics if the build fails
+      # ------------------------------------------------------------
 
-      - name: Upload diagnostics
+      - name: Collect failure diagnostics
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          set +e
+
+          DIAG_DIR="$DIST_DIR/diagnostics"
+          mkdir -p "$DIAG_DIR"
+
+          echo "===== SYSTEM =====" \
+            > "$DIAG_DIR/system.txt"
+
+          uname -a >> "$DIAG_DIR/system.txt"
+          cat /etc/os-release >> "$DIAG_DIR/system.txt"
+          dpkg --print-architecture >> "$DIAG_DIR/system.txt"
+
+          echo "===== TOOL VERSIONS =====" \
+            > "$DIAG_DIR/tool-versions.txt"
+
+          gcc-14 --version >> "$DIAG_DIR/tool-versions.txt" 2>&1
+          g++-14 --version >> "$DIAG_DIR/tool-versions.txt" 2>&1
+          cmake --version >> "$DIAG_DIR/tool-versions.txt" 2>&1
+          make --version >> "$DIAG_DIR/tool-versions.txt" 2>&1
+          ninja --version >> "$DIAG_DIR/tool-versions.txt" 2>&1
+          python3 --version >> "$DIAG_DIR/tool-versions.txt" 2>&1
+
+          if [ -d "$SOURCE_DIR" ]; then
+            git -C "$SOURCE_DIR" status \
+              > "$DIAG_DIR/git-status.txt" 2>&1
+
+            git -C "$SOURCE_DIR" rev-parse HEAD \
+              > "$DIAG_DIR/git-commit.txt" 2>&1
+
+            if [ -f "$SOURCE_DIR/.gitmodules" ]; then
+              cp "$SOURCE_DIR/.gitmodules" \
+                "$DIAG_DIR/gitmodules.txt"
+            fi
+          fi
+
+          if [ -d "$BUILD_DIR" ]; then
+            find "$BUILD_DIR" \
+              -name CMakeCache.txt \
+              -o -name '*.log' \
+              -o -name '*.txt' \
+              | head -n 300 \
+              > "$DIAG_DIR/build-files.txt"
+
+            find "$BUILD_DIR" \
+              -name CMakeCache.txt \
+              -exec cp --parents {} "$DIAG_DIR/" \; \
+              2>/dev/null
+
+            find "$BUILD_DIR" \
+              -name '*.log' \
+              -exec cp --parents {} "$DIAG_DIR/" \; \
+              2>/dev/null
+          fi
+
+          if [ -d "$SOURCE_DIR/build_files/build_environment" ]; then
+            find "$SOURCE_DIR/build_files/build_environment" \
+              -maxdepth 3 \
+              -type f \
+              \( -name '*.log' -o -name 'CMakeLists.txt' \) \
+              | head -n 200 \
+              > "$DIAG_DIR/dependency-source-files.txt"
+          fi
+
+          echo "===== DIAGNOSTICS ====="
+          find "$DIAG_DIR" -type f | head -n 300
+
+          tar -czf "$DIST_DIR/diagnostics.tar.gz" \
+            -C "$DIST_DIR" diagnostics \
+            2>/dev/null
+
+      - name: Upload failure diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
-          name: blender-5.2.3-arm64-diagnostics
+          name: blender-5.2.3-arm64-failure-diagnostics
           path: |
-            build_linux/CMakeCache.txt
-            build_linux/CMakeFiles/CMakeError.log
-            build_linux/CMakeFiles/CMakeOutput.log
-            build_linux/deps_arm64/CMakeCache.txt
-            build_linux/deps_arm64/CMakeFiles/CMakeError.log
-            blender/.gitmodules
-            blender/build_files/build_environment
-            blender/source/blender/blenkernel/BKE_blender_version.h
-          if-no-files-found: ignore
+            dist/diagnostics/
+            dist/diagnostics.tar.gz
+          if-no-files-found: warn
+          compression-level: 6
           retention-days: 7
