@@ -146,7 +146,7 @@ jobs:
           rm -rf /var/lib/apt/lists/*
 
       # ------------------------------------------------------------
-      # 3. Verify architecture and toolchain
+      # 3. Verify ARM64 environment
       # ------------------------------------------------------------
 
       - name: Verify ARM64 environment
@@ -175,18 +175,10 @@ jobs:
           make --version
           ninja --version
           python3 --version
-
-          # Blender dependency scripts rely on legacy CMake 3.x behavior.
-          CMAKE_MAJOR="$(cmake --version | head -n1 | \
-            sed -E 's/[^0-9]*([0-9]+)\..*/\1/')"
-
-          if [ "$CMAKE_MAJOR" -ge 4 ]; then
-            echo "::error::CMake 4.x is not suitable for this dependency build. Use CMake 3.x."
-            exit 1
-          fi
+          curl --version
 
       # ------------------------------------------------------------
-      # 4. Verify required dependency build tools
+      # 4. Verify dependency build tools
       # ------------------------------------------------------------
 
       - name: Verify dependency build tools
@@ -234,7 +226,7 @@ jobs:
           git lfs version
 
       # ------------------------------------------------------------
-      # 6. Download exact Blender source version
+      # 6. Checkout exact Blender source
       # ------------------------------------------------------------
 
       - name: Checkout Blender 5.2.3 source
@@ -282,16 +274,224 @@ jobs:
             "$VERSION_HEADER"
 
           echo "===== SUBMODULE CONFIGURATION ====="
+
           if [ -f .gitmodules ]; then
             cat .gitmodules
           else
             echo "No .gitmodules file"
           fi
 
-          echo "===== SOURCE CHECKOUT COMPLETE ====="
+      # ------------------------------------------------------------
+      # 7. Prefetch ISPC and GMP archives
+      # ------------------------------------------------------------
+
+      - name: Prefetch ISPC and GMP source archives
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          VERSIONS_FILE="$SOURCE_DIR/build_files/build_environment/cmake/versions.cmake"
+          PACKAGE_DIR="$BUILD_DIR/deps_arm64/packages"
+
+          test -f "$VERSIONS_FILE"
+          mkdir -p "$PACKAGE_DIR"
+
+          echo "===== DEPENDENCY SOURCE DEFINITIONS ====="
+
+          grep -n -A 5 -B 1 \
+            -E 'set\((ISPC|GMP)_(VERSION|URI|HASH|HASH_TYPE|FILE)' \
+            "$VERSIONS_FILE"
+
+          python3 - "$VERSIONS_FILE" "$PACKAGE_DIR" <<'PY'
+          import re
+          import sys
+          import os
+          import hashlib
+          import subprocess
+          from pathlib import Path
+
+          versions_file = Path(sys.argv[1])
+          package_dir = Path(sys.argv[2])
+
+          content = versions_file.read_text()
+
+          def get_cmake_var(name):
+              pattern = (
+                  r'(?m)^\s*set\s*\(\s*'
+                  + re.escape(name)
+                  + r'\s+("(?:[^"\\]|\\.)*"|[^\s\)]+)'
+              )
+
+              match = re.search(pattern, content)
+
+              if not match:
+                  raise RuntimeError(
+                      f"Cannot find CMake variable: {name}"
+                  )
+
+              value = match.group(1).strip()
+
+              if value.startswith('"') and value.endswith('"'):
+                  value = value[1:-1]
+
+              return value
+
+          def expand_cmake_vars(value):
+              pattern = re.compile(r'\$\{([A-Za-z0-9_]+)\}')
+
+              for _ in range(20):
+                  new_value = pattern.sub(
+                      lambda match: get_cmake_var(match.group(1)),
+                      value
+                  )
+
+                  if new_value == value:
+                      return value
+
+                  value = new_value
+
+              raise RuntimeError(
+                  f"Too many nested CMake variables: {value}"
+              )
+
+          dependencies = ["ISPC", "GMP"]
+
+          for dep in dependencies:
+              filename = expand_cmake_vars(
+                  get_cmake_var(f"{dep}_FILE")
+              )
+
+              url = expand_cmake_vars(
+                  get_cmake_var(f"{dep}_URI")
+              )
+
+              hash_type = get_cmake_var(
+                  f"{dep}_HASH_TYPE"
+              ).upper()
+
+              expected_hash = get_cmake_var(
+                  f"{dep}_HASH"
+              ).lower()
+
+              if hash_type not in hashlib.algorithms_available:
+                  raise RuntimeError(
+                      f"Unsupported hash algorithm: {hash_type}"
+                  )
+
+              target = package_dir / filename
+              temporary = package_dir / (filename + ".part")
+
+              print()
+              print("=" * 60)
+              print("Dependency:", dep)
+              print("URL:", url)
+              print("Filename:", filename)
+              print("Hash type:", hash_type)
+              print("Expected hash:", expected_hash)
+              print("=" * 60)
+
+              def calculate_hash(path):
+                  digest = hashlib.new(hash_type)
+
+                  with path.open("rb") as f:
+                      for chunk in iter(
+                          lambda: f.read(1024 * 1024), b""
+                      ):
+                          digest.update(chunk)
+
+                  return digest.hexdigest().lower()
+
+              if target.exists():
+                  actual_hash = calculate_hash(target)
+
+                  if actual_hash == expected_hash:
+                      print("[OK] Existing archive hash verified")
+                      continue
+
+                  print("[WARN] Existing archive hash mismatch")
+                  target.unlink()
+
+              temporary.unlink(missing_ok=True)
+
+              command = [
+                  "curl",
+                  "--fail",
+                  "--location",
+                  "--show-error",
+                  "--retry", "10",
+                  "--retry-all-errors",
+                  "--retry-delay", "5",
+                  "--retry-max-time", "1800",
+                  "--connect-timeout", "30",
+                  "--max-time", "3600",
+                  "--output", str(temporary),
+                  url,
+              ]
+
+              print("[DOWNLOAD]", dep)
+
+              try:
+                  subprocess.run(command, check=True)
+
+                  if (
+                      not temporary.exists()
+                      or temporary.stat().st_size == 0
+                  ):
+                      raise RuntimeError(
+                          f"{dep}: downloaded file is empty"
+                      )
+
+                  actual_hash = calculate_hash(temporary)
+
+                  print("Actual hash:", actual_hash)
+
+                  if actual_hash != expected_hash:
+                      raise RuntimeError(
+                          f"{dep}: hash mismatch\n"
+                          f"Expected: {expected_hash}\n"
+                          f"Actual:   {actual_hash}"
+                      )
+
+                  os.replace(temporary, target)
+
+                  print("[OK] Downloaded and verified:", filename)
+
+              except Exception:
+                  temporary.unlink(missing_ok=True)
+                  raise
+
+          print()
+          print("All prefetched archives verified.")
+          PY
+
+          echo "===== VERIFIED PACKAGE CACHE ====="
+          ls -lah "$PACKAGE_DIR"
 
       # ------------------------------------------------------------
-      # 7. Build ARM64 dependencies
+      # 8. Network diagnostics
+      # ------------------------------------------------------------
+
+      - name: Check dependency download endpoints
+        shell: bash
+        run: |
+          set -u
+
+          for url in \
+            https://github.com \
+            https://gmplib.org \
+            https://projects.blender.org
+          do
+            echo
+            echo "===== Testing $url ====="
+
+            curl -IL \
+              --connect-timeout 15 \
+              --max-time 30 \
+              "$url" || true
+          done
+
+      # ------------------------------------------------------------
+      # 9. Build ARM64 dependencies
       # ------------------------------------------------------------
 
       - name: Build ARM64 dependencies
@@ -304,7 +504,6 @@ jobs:
           export CC=gcc-14
           export CXX=g++-14
           export FC=gfortran-14
-
           export BUILD_DIR="$BUILD_DIR"
 
           echo "===== DEPENDENCY BUILD CONFIGURATION ====="
@@ -313,12 +512,13 @@ jobs:
           echo "Jobs: $BUILD_JOBS"
           echo "Architecture: $(uname -m)"
 
+          echo "===== PACKAGE CACHE ====="
+          ls -lah "$BUILD_DIR/deps_arm64/packages"
+
           echo "===== START MAKE DEPS ====="
 
-          # Do not run make update here.
-          # The v5.2.3 tag is intentionally checked out detached.
-          # Its release source does not provide a precompiled ARM64
-          # dependency submodule.
+          # Do not run make update.
+          # Build the dependencies from the exact v5.2.3 source.
 
           make deps NPROCS="$BUILD_JOBS"
 
@@ -326,15 +526,10 @@ jobs:
 
           test -d "$SOURCE_DIR/lib/linux_arm64"
 
-          find "$SOURCE_DIR/lib/linux_arm64" \
-            -maxdepth 2 \
-            -type d \
-            | head -n 100
-
-          echo "===== DEPENDENCIES BUILT ====="
+          ls -lah "$SOURCE_DIR/lib/linux_arm64"
 
       # ------------------------------------------------------------
-      # 8. Build Blender
+      # 10. Build Blender
       # ------------------------------------------------------------
 
       - name: Build Blender
@@ -355,9 +550,6 @@ jobs:
           echo "Compiler: GCC 14"
           echo "Jobs: $BUILD_JOBS"
 
-          # Build the normal Blender target.
-          # Do not use the release target: it enables CUDA/OptiX.
-
           make NPROCS="$BUILD_JOBS"
 
           echo "===== BUILD COMPLETE ====="
@@ -367,7 +559,7 @@ jobs:
           "$BUILD_DIR/bin/blender" --version
 
       # ------------------------------------------------------------
-      # 9. Inspect dynamic dependencies
+      # 11. Inspect dynamic dependencies
       # ------------------------------------------------------------
 
       - name: Inspect Blender runtime dependencies
@@ -395,7 +587,7 @@ jobs:
           "$BLENDER" --version
 
       # ------------------------------------------------------------
-      # 10. Inspect Blender build features
+      # 12. Inspect Blender build features
       # ------------------------------------------------------------
 
       - name: Verify Blender build features
@@ -434,7 +626,7 @@ jobs:
           '
 
       # ------------------------------------------------------------
-      # 11. Cycles CPU rendering test
+      # 13. Cycles CPU rendering test
       # ------------------------------------------------------------
 
       - name: Test Cycles CPU rendering
@@ -464,6 +656,7 @@ jobs:
           scene.render.filepath = output
 
           bpy.ops.mesh.primitive_cube_add(size=2)
+
           cube = bpy.context.object
 
           material = bpy.data.materials.new("TestMaterial")
@@ -471,6 +664,7 @@ jobs:
           cube.data.materials.append(material)
 
           bpy.ops.object.camera_add(location=(4, -4, 3))
+
           camera = bpy.context.object
           camera.rotation_euler = (1.1, 0.0, 0.78)
           scene.camera = camera
@@ -479,12 +673,14 @@ jobs:
               type="AREA",
               location=(2, -3, 4)
           )
+
           light = bpy.context.object
           light.data.energy = 500
           light.data.shape = "DISK"
           light.data.size = 5
 
           print("Starting Cycles CPU render...")
+
           bpy.ops.render.render(write_still=True)
 
           assert os.path.isfile(output), "Render output missing"
@@ -502,7 +698,7 @@ jobs:
           ls -lh /tmp/blender-cycles-test.png
 
       # ------------------------------------------------------------
-      # 12. Prepare portable package
+      # 14. Prepare portable package
       # ------------------------------------------------------------
 
       - name: Prepare portable package
@@ -518,9 +714,6 @@ jobs:
 
           test -d "$BUILD_DIR/bin"
           test -x "$BUILD_DIR/bin/blender"
-
-          # Preserve Blender's complete installed directory layout,
-          # including Python modules, scripts and bundled resources.
 
           cp -a "$BUILD_DIR/bin/." "$PACKAGE_DIR/"
 
@@ -586,7 +779,7 @@ jobs:
           find "$PACKAGE_DIR" -maxdepth 2 -type f | head -n 100
 
       # ------------------------------------------------------------
-      # 13. Create compressed archive
+      # 15. Create tar.zst archive
       # ------------------------------------------------------------
 
       - name: Create tar.zst archive
@@ -614,7 +807,7 @@ jobs:
           zstd -t "${PACKAGE_NAME}.tar.zst"
 
       # ------------------------------------------------------------
-      # 14. Upload GitHub Actions artifact
+      # 16. Upload GitHub Actions artifact
       # ------------------------------------------------------------
 
       - name: Upload build artifact
@@ -629,7 +822,7 @@ jobs:
           retention-days: 14
 
       # ------------------------------------------------------------
-      # 15. Optional GitHub Release
+      # 17. Optional GitHub Release
       # ------------------------------------------------------------
 
       - name: Publish GitHub Release
@@ -652,7 +845,6 @@ jobs:
 
             This package is not fully static and requires compatible
             runtime system libraries.
-
           files: |
             dist/blender-5.2.3-linux-arm64-debian13.tar.zst
             dist/blender-5.2.3-linux-arm64-debian13.tar.zst.sha256
@@ -660,7 +852,7 @@ jobs:
           generate_release_notes: false
 
       # ------------------------------------------------------------
-      # 16. Collect diagnostics if the build fails
+      # 18. Collect failure diagnostics
       # ------------------------------------------------------------
 
       - name: Collect failure diagnostics
@@ -700,13 +892,17 @@ jobs:
               cp "$SOURCE_DIR/.gitmodules" \
                 "$DIAG_DIR/gitmodules.txt"
             fi
+
+            if [ -f "$SOURCE_DIR/build_files/build_environment/cmake/versions.cmake" ]; then
+              cp \
+                "$SOURCE_DIR/build_files/build_environment/cmake/versions.cmake" \
+                "$DIAG_DIR/versions.cmake"
+            fi
           fi
 
           if [ -d "$BUILD_DIR" ]; then
             find "$BUILD_DIR" \
-              -name CMakeCache.txt \
-              -o -name '*.log' \
-              -o -name '*.txt' \
+              \( -name CMakeCache.txt -o -name '*.log' \) \
               | head -n 300 \
               > "$DIAG_DIR/build-files.txt"
 
@@ -721,13 +917,9 @@ jobs:
               2>/dev/null
           fi
 
-          if [ -d "$SOURCE_DIR/build_files/build_environment" ]; then
-            find "$SOURCE_DIR/build_files/build_environment" \
-              -maxdepth 3 \
-              -type f \
-              \( -name '*.log' -o -name 'CMakeLists.txt' \) \
-              | head -n 200 \
-              > "$DIAG_DIR/dependency-source-files.txt"
+          if [ -d "$BUILD_DIR/deps_arm64/packages" ]; then
+            ls -lah "$BUILD_DIR/deps_arm64/packages" \
+              > "$DIAG_DIR/package-cache.txt" 2>&1
           fi
 
           echo "===== DIAGNOSTICS ====="
