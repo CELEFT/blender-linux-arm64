@@ -68,7 +68,6 @@ jobs:
 
           dnf makecache
           retry 10 15 dnf install -y epel-release
-          # 补充 Vulkan 相关的开发头文件和工具链
           retry 10 15 dnf install -y git git-lfs gcc-toolset-${{ github.event.inputs.gcc_version }} ccache python3 vulkan-loader-devel vulkan-headers vulkan-tools || true
 
           mv /usr/bin/sudo /usr/bin/sudo.orig || true
@@ -123,7 +122,6 @@ jobs:
             fi
           fi
 
-          # 强制跳过 ROCm 安装
           SETUP_SCRIPT="build_files/build_environment/linux/linux_rocky8_setup.sh"
           if [ -f "$SETUP_SCRIPT" ] && ! grep -q 'if \[ "$(uname -i)" != "aarch64" \]' "$SETUP_SCRIPT"; then
             echo "Injecting aarch64 check for ROCm in $SETUP_SCRIPT"
@@ -157,14 +155,14 @@ jobs:
           dnf clean all
 
       # --------------------------------------------------
-      # 缓存机制：注意这里缓存 key 的 v3 已升级为 v4
+      # 缓存机制：注意这里的 v5 版本升级，避免读取旧的失败缓存
       # --------------------------------------------------
       - name: Cache Download Packages
         uses: actions/cache@v4
         id: cache-pkgs
         with:
           path: ~/blender-git/build_linux/deps_arm64/packages
-          key: blender-pkgs-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v4
+          key: blender-pkgs-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v5
           restore-keys: |
             blender-pkgs-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-
 
@@ -173,7 +171,7 @@ jobs:
         id: cache-deps
         with:
           path: ~/blender-git/blender/lib/linux_arm64
-          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v4
+          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v5
           restore-keys: |
             blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-
 
@@ -249,6 +247,12 @@ jobs:
                   "https://downloads.sourceforge.net/",
                   "https://master.dl.sourceforge.net/",
               ]),
+              # FFmpeg 官网易超时，强制走国内镜像
+              ("http://ffmpeg.org/releases/", [
+                  "https://mirrors.tuna.tsinghua.edu.cn/ffmpeg/",
+                  "https://mirrors.ustc.edu.cn/ffmpeg/",
+                  "https://ffmpeg.org/releases/",
+              ]),
               # Rubberband
               ("https://breakfastquay.com/files/releases/", [
                   "https://github.com/breakfastquay/rubberband/releases/download/v4.0.0/",
@@ -264,7 +268,6 @@ jobs:
               ]),
           ]
 
-          # Blender 官方 SVN 镜像前缀（PACKAGE_USE_UPSTREAM_SOURCES=OFF 时使用）
           BLENDER_SVN_MIRROR = "https://svn.blender.org/svnroot/bf-blender/trunk/lib/packages/"
 
           tasks = []
@@ -276,6 +279,8 @@ jobs:
                       url = resolve(v)
                       filename = resolve(variables[file_key])
                       tasks.append((url, os.path.join(PKG_DIR, filename), filename))
+
+          failed_tasks = []
 
           def download(url, dest, filename):
               if os.path.exists(dest) and os.path.getsize(dest) > 0:
@@ -291,10 +296,8 @@ jobs:
                       for mirror in mirrors:
                           urls_to_try.append(mirror + suffix)
 
-              # 添加 Blender SVN 镜像降级兜底
               urls_to_try.append(BLENDER_SVN_MIRROR + filename)
 
-              # 针对特定包的硬编码兜底
               if "pthreads4w" in filename:
                   urls_to_try.append("https://sourceforge.net/projects/pthreads4w/files/pthreads4w-code-v3.0.0.zip/download")
                   urls_to_try.append("https://downloads.sourceforge.net/project/pthreads4w/pthreads4w-code-v3.0.0.zip")
@@ -304,23 +307,49 @@ jobs:
                   urls_to_try.append("https://github.com/pnggroup/libpng/releases/download/v1.6.58/libpng-1.6.58.tar.xz")
 
               for attempt_url in urls_to_try:
-                  # 关键修复：移除伪造的 Mozilla UA，使用 curl 默认 UA 防止被 Cloudflare 拦截
                   cmd = ["curl", "-L", "-4", "-f", "-sS", "--connect-timeout", "15", "-o", dest, attempt_url]
-                  if subprocess.run(cmd).returncode == 0 and os.path.getsize(dest) > 0:
+                  res = subprocess.run(cmd, capture_output=True, text=True)
+                  if res.returncode == 0 and os.path.getsize(dest) > 0:
                       print(f"[OK] {filename} (via {attempt_url})")
                       if filename in KNOWN_SHA256:
                           verify_sha256(dest, KNOWN_SHA256[filename])
                       return
+                  else:
+                      # 输出具体的失败原因，便于排查是超时还是 403
+                      print(f"  [WARN] {filename} failed from {attempt_url}: {res.stderr.strip()}")
 
-              raise RuntimeError(f"Failed to download {filename} from all sources (original: {url})")
+              raise RuntimeError(f"Failed to download {filename} from all sources.")
+
+          def download_wrapper(url, dest, filename):
+              try:
+                  download(url, dest, filename)
+              except Exception as e:
+                  failed_tasks.append((filename, str(e)))
 
           with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-              futures = [executor.submit(download, url, dest, fn) for url, dest, fn in tasks]
+              futures = [executor.submit(download_wrapper, url, dest, fn) for url, dest, fn in tasks]
               for future in concurrent.futures.as_completed(futures):
                   future.result()
 
+          if failed_tasks:
+              print("\n" + "="*50)
+              print("❌ 以下依赖下载失败:")
+              for fn, err in failed_tasks:
+                  print(f"  - {fn}: {err}")
+              print("="*50)
+              # 抛出异常中断流程，但前面的下载进度会被缓存保留
+              raise RuntimeError("Some dependencies failed to download.")
+
           print(f"\nAll dependencies downloaded and ready in {PKG_DIR}")
           PYEOF
+
+      # 强烈建议的缓存机制：即使下载部分失败，或后续编译崩溃，也会把已经下载成功的包存下来！
+      - name: Save Download Packages Cache
+        if: always() && steps.cache-pkgs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/blender-git/build_linux/deps_arm64/packages
+          key: blender-pkgs-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v5
 
       - name: Build dependencies
         if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
@@ -360,7 +389,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/blender-git/blender/lib/linux_arm64
-          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v4
+          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v5
 
       - name: Clean dependencies build artifacts
         if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
@@ -399,7 +428,7 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
             
-            # 核心修改：强制关闭所有非必要 GPU 计算后端
+            # 核心：强制关闭所有非必要 GPU 计算后端
             -DWITH_CYCLES_DEVICE_CUDA=OFF
             -DWITH_CYCLES_DEVICE_OPTIX=OFF
             -DWITH_CYCLES_CUDA_BINARIES=OFF
@@ -408,7 +437,7 @@ jobs:
             -DWITH_CYCLES_DEVICE_ONEAPI=OFF
             -DWITH_CUDA_DYNLOAD=OFF
             
-            # 核心修改：显式开启 CPU 渲染与 Vulkan 后端
+            # 核心：显式开启 CPU 渲染与 Vulkan 后端
             -DWITH_CYCLES=ON
             -DWITH_CYCLES_DEVICE_CPU=ON
             -DWITH_VULKAN_BACKEND=ON
@@ -420,7 +449,6 @@ jobs:
           elif [ "${{ github.event.inputs.build_type }}" == "lite" ]; then
             cmake -C ../blender/build_files/cmake/config/blender_lite.cmake "${CMAKE_ARGS[@]}" ../blender
           else
-            # 修复 Debug 模式下的变量替换逻辑
             for i in "${!CMAKE_ARGS[@]}"; do
               if [[ "${CMAKE_ARGS[$i]}" == "-DCMAKE_BUILD_TYPE=Release" ]]; then
                 CMAKE_ARGS[$i]="-DCMAKE_BUILD_TYPE=Debug"
