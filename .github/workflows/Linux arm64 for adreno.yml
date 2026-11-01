@@ -37,6 +37,9 @@ jobs:
       DIST_DIR: ${{ github.workspace }}/dist
       STAGE_DIR: ${{ github.workspace }}/stage
       PKG_DIR: ${{ github.workspace }}/build_linux/deps_arm64/packages
+      
+      # 启用 ccache 加速主程序编译
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
       # --------------------------------------------------
@@ -63,7 +66,7 @@ jobs:
           set -euxo pipefail
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            build-essential gcc g++ cmake ninja-build make pkg-config \
+            build-essential gcc g++ cmake ninja-build make pkg-config ccache \
             git git-lfs subversion curl wget ca-certificates file patchelf rsync \
             unzip zip xz-utils zstd tar bzip2 patch perl gawk m4 autoconf automake \
             autopoint libtool gettext help2man texinfo tcl meson flex bison yasm nasm \
@@ -110,7 +113,7 @@ jobs:
       - name: Cache Blender source repository
         uses: actions/cache@v4
         with:
-          path: blender
+          path: ${{ env.SOURCE_DIR }}
           key: ${{ runner.os }}-${{ runner.arch }}-blender-source-${{ env.BLENDER_TAG }}
 
       - name: Checkout Blender source
@@ -128,14 +131,34 @@ jobs:
           git describe --tags --exact-match
 
       # --------------------------------------------------
-      # 3. 带镜像回退 + SHA256 校验的 Python 预下载
+      # 3. 多层缓存机制：源码包缓存 + 依赖编译产物缓存 + ccache
       # --------------------------------------------------
-      - name: Cache Blender Dependencies Packages
+      - name: Cache Download Packages
         uses: actions/cache@v4
         with:
           path: ${{ env.PKG_DIR }}
           key: ${{ runner.os }}-${{ runner.arch }}-blender-deps-packages-${{ env.BLENDER_TAG }}
 
+      - name: Cache Compiled Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.BUILD_DIR }}/deps_arm64
+            ${{ env.SOURCE_DIR }}/lib
+          key: ${{ runner.os }}-${{ runner.arch }}-blender-deps-build-${{ env.BLENDER_TAG }}-${{ hashFiles('blender/build_files/build_environment/cmake/versions.cmake') }}
+
+      - name: Cache ccache for Blender Build
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-${{ runner.arch }}-ccache-${{ env.BLENDER_TAG }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-ccache-${{ env.BLENDER_TAG }}-
+            ${{ runner.os }}-${{ runner.arch }}-ccache-
+
+      # --------------------------------------------------
+      # 4. 带镜像回退 + SHA256 校验的 Python 预下载
+      # --------------------------------------------------
       - name: Pre-download dependencies concurrently (Python)
         shell: bash
         run: |
@@ -162,7 +185,6 @@ jobs:
                       text = text.replace("${" + k + "}", v)
               return text
 
-          # 已知关键文件的 SHA256 校验值
           KNOWN_SHA256 = {
               "gmp-6.3.0.tar.xz": "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898",
           }
@@ -177,7 +199,6 @@ jobs:
                   raise RuntimeError(f"SHA256 mismatch for {os.path.basename(filepath)}: expected {expected}, got {actual}")
               print(f"[VERIFY OK] {os.path.basename(filepath)}")
 
-          # 修复后的镜像规则：gmplib.org 屏蔽 GitHub IP，改用 GNU 官方镜像与高校镜像
           MIRROR_RULES = [
               ("https://gmplib.org/download/gmp/", [
                   "https://ftpmirror.gnu.org/gmp/",
@@ -235,13 +256,14 @@ jobs:
           PYEOF
 
       # --------------------------------------------------
-      # 4. 编译依赖、主程序与打包
+      # 5. 编译依赖、主程序与打包
       # --------------------------------------------------
       - name: Build Blender Dependencies
         shell: bash
         run: |
           set -euxo pipefail
           cd "$SOURCE_DIR"
+          # 如果依赖已通过缓存存在，make deps 会瞬间跳过
           make deps -j"$BUILD_JOBS" \
             DEPS_BUILD_COMMAND="make -s" \
             ARGS="-DPACKAGE_DIR=$PKG_DIR -DPACKAGE_USE_UPSTREAM_SOURCES=OFF"
@@ -251,8 +273,16 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$SOURCE_DIR"
-          make config
+          
+          # 启用 ccache 加速 C/C++ 编译
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          ccache --max-size=4G
+          ccache --show-stats
+          
+          make config ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
           make -j"$BUILD_JOBS"
+          
+          ccache --show-stats
 
       - name: Package Blender
         shell: bash
@@ -265,7 +295,7 @@ jobs:
           ls -lh "$DIST_DIR"
 
       # --------------------------------------------------
-      # 5. 产物上传与发布
+      # 6. 产物上传与发布
       # --------------------------------------------------
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
