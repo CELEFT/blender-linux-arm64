@@ -136,10 +136,8 @@ jobs:
           set -euxo pipefail
           cd "$SOURCE_DIR"
 
-          # 浅克隆 lfdevs 补丁仓库
           git clone --depth 1 --branch ci https://github.com/lfdevs/blender-linux-arm64.git /tmp/lfdevs-patches
 
-          # 优先尝试 v5.1.0 补丁，如果因为代码差异失败则跳过
           PATCH_DIR="/tmp/lfdevs-patches/patches/v5.1.0"
           if [ -d "$PATCH_DIR" ]; then
             for patch in "$PATCH_DIR"/*.patch; do
@@ -152,18 +150,6 @@ jobs:
               fi
             done
           fi
-
-          # 强制兜底修复：确保 versions.cmake 在 options.cmake 之后加载
-          # 这是解决 BLENDER_PLATFORM_ARM 未定义导致 OpenSSL 选型错误的关键
-          CMAKE_LIST="build_files/build_environment/CMakeLists.txt"
-          if grep -q "include(cmake/versions.cmake)" "$CMAKE_LIST"; then
-            sed -i '/include(cmake\/versions.cmake)/d' "$CMAKE_LIST"
-            sed -i '/include(cmake\/options.cmake)/a include(cmake/versions.cmake)' "$CMAKE_LIST"
-            echo "Forced include order fix for BLENDER_PLATFORM_ARM."
-          fi
-
-          # 清理旧的 CMake 缓存，防止错误配置被复用
-          rm -rf "$BUILD_DIR/deps_arm64/CMakeCache.txt" "$BUILD_DIR/deps_arm64/CMakeFiles"
 
       # --------------------------------------------------
       # 4. 多层缓存机制
@@ -298,6 +284,27 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$SOURCE_DIR"
+
+          # 修正 include 顺序，确保 BLENDER_PLATFORM_ARM 在编译 OpenSSL 前被定义
+          CMAKE_LIST="build_files/build_environment/CMakeLists.txt"
+          awk '
+            /include\(cmake\/options\.cmake\)/ {
+              print;
+              print "include(cmake/versions.cmake)";
+              next
+            }
+            /include\(cmake\/versions\.cmake\)/ {
+              next
+            }
+            { print }
+          ' "$CMAKE_LIST" > "${CMAKE_LIST}.tmp" && mv "${CMAKE_LIST}.tmp" "$CMAKE_LIST"
+
+          echo "--- Reordered CMakeLists.txt includes ---"
+          grep -n "include(cmake/" "$CMAKE_LIST"
+
+          # 清理旧的 CMake 缓存，防止错误的 SSL_OS_COMPILER 配置被复用
+          rm -rf "$BUILD_DIR/deps_arm64/CMakeCache.txt" "$BUILD_DIR/deps_arm64/CMakeFiles"
+
           make deps -j"$BUILD_JOBS" \
             DEPS_BUILD_COMMAND="make -s" \
             ARGS="-DPACKAGE_DIR=$PKG_DIR -DPACKAGE_USE_UPSTREAM_SOURCES=OFF"
