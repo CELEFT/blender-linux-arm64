@@ -128,7 +128,7 @@ jobs:
           git describe --tags --exact-match
 
       # --------------------------------------------------
-      # 3. 带镜像回退机制的高速 Python 预下载
+      # 3. 带镜像回退 + SHA256 校验的 Python 预下载
       # --------------------------------------------------
       - name: Cache Blender Dependencies Packages
         uses: actions/cache@v4
@@ -143,7 +143,7 @@ jobs:
           cd "$SOURCE_DIR"
           
           python3 << 'PYEOF'
-          import re, os, subprocess, concurrent.futures
+          import re, os, subprocess, concurrent.futures, hashlib
           
           VERSIONS_FILE = "build_files/build_environment/cmake/versions.cmake"
           PKG_DIR = os.environ.get("PKG_DIR")
@@ -152,7 +152,6 @@ jobs:
           with open(VERSIONS_FILE) as f:
               content = f.read()
 
-          # 提取所有变量
           matches = re.findall(r'set\(\s*(\w+)\s+["\']?([^"\'\n\)]+)["\']?\s*\)', content)
           variables = {k: v.strip() for k, v in matches}
 
@@ -163,9 +162,29 @@ jobs:
                       text = text.replace("${" + k + "}", v)
               return text
 
-          # 定义常见易挂源的备用镜像站
+          # 已知关键文件的 SHA256 校验值
+          KNOWN_SHA256 = {
+              "gmp-6.3.0.tar.xz": "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898",
+          }
+
+          def verify_sha256(filepath, expected):
+              h = hashlib.sha256()
+              with open(filepath, "rb") as f:
+                  for chunk in iter(lambda: f.read(65536), b""):
+                      h.update(chunk)
+              actual = h.hexdigest()
+              if actual != expected:
+                  raise RuntimeError(f"SHA256 mismatch for {os.path.basename(filepath)}: expected {expected}, got {actual}")
+              print(f"[VERIFY OK] {os.path.basename(filepath)}")
+
+          # 修复后的镜像规则：gmplib.org 屏蔽 GitHub IP，改用 GNU 官方镜像与高校镜像
           MIRROR_RULES = [
-              ("https://gmplib.org/download/", ["https://mirrors.kernel.org/gnu/gmp/", "https://mirrors.tuna.tsinghua.edu.cn/gnu/gmp/"]),
+              ("https://gmplib.org/download/gmp/", [
+                  "https://ftpmirror.gnu.org/gmp/",
+                  "https://mirrors.hust.edu.cn/gnu/gmp/",
+                  "https://www.mirrorservice.org/sites/ftp.gnu.org/gnu/gmp/",
+                  "https://mirrors.tuna.tsinghua.edu.cn/gnu/gmp/",
+              ]),
               ("http://downloads.sourceforge.net/", ["https://downloads.sourceforge.net/", "https://master.dl.sourceforge.net/project/"]),
               ("http://prdownloads.sourceforge.net/", ["https://downloads.sourceforge.net/"]),
               ("https://breakfastquay.com/files/releases/", ["https://github.com/breakfastquay/rubberband/releases/download/4.0.0/"]),
@@ -173,7 +192,6 @@ jobs:
               ("http://ftp.gnu.org/pub/gnu/", ["https://mirrors.kernel.org/gnu/", "https://mirrors.tuna.tsinghua.edu.cn/gnu/"]),
           ]
 
-          # 找出所有需要下载的 URI 和对应的文件
           tasks = []
           for k, v in variables.items():
               if k.endswith("_URI"):
@@ -187,10 +205,11 @@ jobs:
           def download(url, dest, filename):
               if os.path.exists(dest) and os.path.getsize(dest) > 0:
                   print(f"[SKIP] {filename}")
+                  if filename in KNOWN_SHA256:
+                      verify_sha256(dest, KNOWN_SHA256[filename])
                   return
 
               urls_to_try = [url]
-              # 根据规则寻找备用镜像
               for prefix, mirrors in MIRROR_RULES:
                   if url.startswith(prefix):
                       suffix = url[len(prefix):]
@@ -198,19 +217,19 @@ jobs:
                           urls_to_try.append(mirror + suffix)
 
               for attempt_url in urls_to_try:
-                  # 强制 IPv4，10秒连接超时，遇到网络问题立刻换源
                   cmd = ["curl", "-L", "-4", "-f", "-sS", "--connect-timeout", "10", "-o", dest, attempt_url]
                   if subprocess.run(cmd).returncode == 0 and os.path.getsize(dest) > 0:
                       print(f"[OK] {filename} (via {attempt_url})")
+                      if filename in KNOWN_SHA256:
+                          verify_sha256(dest, KNOWN_SHA256[filename])
                       return
 
               raise RuntimeError(f"Failed to download {filename} from all sources (original: {url})")
 
-          # 8 线程并发下载
           with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
               futures = [executor.submit(download, url, dest, fn) for url, dest, fn in tasks]
               for future in concurrent.futures.as_completed(futures):
-                  future.result() # 如果彻底失败则抛出异常中断
+                  future.result()
 
           print(f"\nAll dependencies downloaded and ready in {PKG_DIR}")
           PYEOF
@@ -223,7 +242,6 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$SOURCE_DIR"
-          # 覆盖 DEPS_BUILD_COMMAND 修复 -j1 目标报错问题，并强制离线构建
           make deps -j"$BUILD_JOBS" \
             DEPS_BUILD_COMMAND="make -s" \
             ARGS="-DPACKAGE_DIR=$PKG_DIR -DPACKAGE_USE_UPSTREAM_SOURCES=OFF"
