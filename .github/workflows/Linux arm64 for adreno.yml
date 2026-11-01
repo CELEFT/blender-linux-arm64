@@ -68,7 +68,7 @@ jobs:
 
           dnf makecache
           retry 10 15 dnf install -y epel-release
-          retry 10 15 dnf install -y git git-lfs gcc-toolset-${{ github.event.inputs.gcc_version }} ccache
+          retry 10 15 dnf install -y git git-lfs gcc-toolset-${{ github.event.inputs.gcc_version }} ccache python3
 
           # 绕过容器内 sudo 的 TTY 认证限制
           mv /usr/bin/sudo /usr/bin/sudo.orig || true
@@ -93,7 +93,6 @@ jobs:
       - name: Clone patches repository
         run: |
           cd ~/blender-git
-          # 优先尝试克隆你的 patches-repo，如果没配则 fallback 到 lfdevs
           if ! git clone -b ci --depth 1 ${{ github.server_url }}/${{ github.repository }}.git patches-repo 2>/dev/null; then
             echo "Failed to clone own repo, falling back to lfdevs community patches..."
             git clone -b ci --depth 1 https://github.com/lfdevs/blender-linux-arm64.git patches-repo
@@ -124,8 +123,7 @@ jobs:
             fi
           fi
 
-          # --- 强力兜底：确保 ARM64 下不安装 ROCm ---
-          # 解决 linux_rocky8_setup.sh 在 ARM64 上尝试安装 AMD 计算库导致的崩溃
+          # 强力兜底：确保 ARM64 下不安装 ROCm
           SETUP_SCRIPT="build_files/build_environment/linux/linux_rocky8_setup.sh"
           if [ -f "$SETUP_SCRIPT" ] && ! grep -q 'if \[ "$(uname -i)" != "aarch64" \]' "$SETUP_SCRIPT"; then
             echo "Injecting aarch64 check for ROCm in $SETUP_SCRIPT"
@@ -183,6 +181,105 @@ jobs:
           ccache --zero-stats
           ccache --show-stats
 
+      # --------------------------------------------------
+      # 新增：带镜像回退 + SHA256 校验的 Python 预下载
+      # --------------------------------------------------
+      - name: Pre-download dependencies (Python)
+        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
+        shell: bash
+        run: |
+          cd ~/blender-git/blender
+          python3 << 'PYEOF'
+          import re, os, subprocess, concurrent.futures, hashlib
+
+          VERSIONS_FILE = "build_files/build_environment/cmake/versions.cmake"
+          # 适配 Rocky 方案下的 CMake 下载路径
+          PKG_DIR = os.path.expanduser("~/blender-git/build_linux/deps_arm64/packages")
+          os.makedirs(PKG_DIR, exist_ok=True)
+
+          with open(VERSIONS_FILE) as f:
+              content = f.read()
+
+          matches = re.findall(r'set\(\s*(\w+)\s+["\']?([^"\'\n\)]+)["\']?\s*\)', content)
+          variables = {k: v.strip() for k, v in matches}
+
+          def resolve(text):
+              for _ in range(10):
+                  if "${" not in text: break
+                  for k, v in variables.items():
+                      text = text.replace("${" + k + "}", v)
+              return text
+
+          KNOWN_SHA256 = {
+              "gmp-6.3.0.tar.xz": "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898",
+          }
+
+          def verify_sha256(filepath, expected):
+              h = hashlib.sha256()
+              with open(filepath, "rb") as f:
+                  for chunk in iter(lambda: f.read(65536), b""):
+                      h.update(chunk)
+              actual = h.hexdigest()
+              if actual != expected:
+                  raise RuntimeError(f"SHA256 mismatch for {os.path.basename(filepath)}: expected {expected}, got {actual}")
+              print(f"[VERIFY OK] {os.path.basename(filepath)}")
+
+          MIRROR_RULES = [
+              ("https://gmplib.org/download/gmp/", [
+                  "https://ftpmirror.gnu.org/gmp/",
+                  "https://mirrors.hust.edu.cn/gnu/gmp/",
+                  "https://www.mirrorservice.org/sites/ftp.gnu.org/gnu/gmp/",
+                  "https://mirrors.tuna.tsinghua.edu.cn/gnu/gmp/",
+              ]),
+              ("http://downloads.sourceforge.net/", ["https://downloads.sourceforge.net/", "https://master.dl.sourceforge.net/project/"]),
+              ("http://prdownloads.sourceforge.net/", ["https://downloads.sourceforge.net/"]),
+              ("https://breakfastquay.com/files/releases/", ["https://github.com/breakfastquay/rubberband/releases/download/4.0.0/"]),
+              ("https://downloads.xiph.org/releases/", ["https://ftp.osuosl.org/pub/xiph/releases/"]),
+              ("http://ftp.gnu.org/pub/gnu/", ["https://mirrors.kernel.org/gnu/", "https://mirrors.tuna.tsinghua.edu.cn/gnu/"]),
+          ]
+
+          tasks = []
+          for k, v in variables.items():
+              if k.endswith("_URI"):
+                  base = k[:-4]
+                  file_key = base + "_FILE"
+                  if file_key in variables:
+                      url = resolve(v)
+                      filename = resolve(variables[file_key])
+                      tasks.append((url, os.path.join(PKG_DIR, filename), filename))
+
+          def download(url, dest, filename):
+              if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                  print(f"[SKIP] {filename}")
+                  if filename in KNOWN_SHA256:
+                      verify_sha256(dest, KNOWN_SHA256[filename])
+                  return
+
+              urls_to_try = [url]
+              for prefix, mirrors in MIRROR_RULES:
+                  if url.startswith(prefix):
+                      suffix = url[len(prefix):]
+                      for mirror in mirrors:
+                          urls_to_try.append(mirror + suffix)
+
+              for attempt_url in urls_to_try:
+                  cmd = ["curl", "-L", "-4", "-f", "-sS", "--connect-timeout", "15", "-o", dest, attempt_url]
+                  if subprocess.run(cmd).returncode == 0 and os.path.getsize(dest) > 0:
+                      print(f"[OK] {filename} (via {attempt_url})")
+                      if filename in KNOWN_SHA256:
+                          verify_sha256(dest, KNOWN_SHA256[filename])
+                      return
+
+              raise RuntimeError(f"Failed to download {filename} from all sources (original: {url})")
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+              futures = [executor.submit(download, url, dest, fn) for url, dest, fn in tasks]
+              for future in concurrent.futures.as_completed(futures):
+                  future.result()
+
+          print(f"\nAll dependencies downloaded and ready in {PKG_DIR}")
+          PYEOF
+
       - name: Build dependencies
         if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
         shell: bash
@@ -208,7 +305,6 @@ jobs:
           export CCACHE_DIR=/root/.ccache
           cd ~/blender-git/blender
           
-          # 尝试规避部分依赖在编译时需要 CUDA 的问题
           export LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
           export PATH=/usr/local/cuda/bin${PATH:+:${PATH}}
           export LANG=en_US.UTF-8
@@ -216,7 +312,8 @@ jobs:
           export CC=/opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/root/usr/bin/gcc
           export CXX=/opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/root/usr/bin/g++
           
-          retry 10 15 make deps -j$(nproc)
+          # 强制 CMake 优先使用我们预下载的包
+          retry 10 15 make deps -j$(nproc) ARGS="-DPACKAGE_DIR=$HOME/blender-git/build_linux/deps_arm64/packages -DPACKAGE_USE_UPSTREAM_SOURCES=OFF"
           unset CC CXX
 
       - name: Save Blender dependencies cache
