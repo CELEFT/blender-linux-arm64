@@ -157,14 +157,14 @@ jobs:
           dnf clean all
 
       # --------------------------------------------------
-      # 缓存机制：源码包缓存、编译产物缓存、ccache
+      # 缓存机制：注意这里缓存 key 的 v3 已升级为 v4
       # --------------------------------------------------
       - name: Cache Download Packages
         uses: actions/cache@v4
         id: cache-pkgs
         with:
           path: ~/blender-git/build_linux/deps_arm64/packages
-          key: blender-pkgs-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v3
+          key: blender-pkgs-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v4
           restore-keys: |
             blender-pkgs-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-
 
@@ -173,7 +173,7 @@ jobs:
         id: cache-deps
         with:
           path: ~/blender-git/blender/lib/linux_arm64
-          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v3
+          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v4
           restore-keys: |
             blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-
 
@@ -233,11 +233,14 @@ jobs:
               print(f"[VERIFY OK] {os.path.basename(filepath)}")
 
           MIRROR_RULES = [
+              # GMP 镜像优化
               ("https://gmplib.org/download/gmp/", [
-                  "https://ftpmirror.gnu.org/gmp/",
+                  "https://ftp.gnu.org/gnu/gmp/",
+                  "https://ftpmirror.gnu.org/gnu/gmp/",
                   "https://mirrors.kernel.org/gnu/gmp/",
                   "https://mirrors.tuna.tsinghua.edu.cn/gnu/gmp/",
               ]),
+              # SourceForge 标准项目路径
               ("http://prdownloads.sourceforge.net/", [
                   "https://master.dl.sourceforge.net/project/",
                   "https://downloads.sourceforge.net/project/",
@@ -246,13 +249,23 @@ jobs:
                   "https://downloads.sourceforge.net/",
                   "https://master.dl.sourceforge.net/",
               ]),
+              # Rubberband
               ("https://breakfastquay.com/files/releases/", [
                   "https://github.com/breakfastquay/rubberband/releases/download/v4.0.0/",
-                  "https://github.com/breakfastquay/rubberband/releases/download/4.0.0/" 
+                  "https://github.com/breakfastquay/rubberband/releases/download/4.0.0/",
               ]),
+              # Xiph
               ("https://downloads.xiph.org/releases/", ["https://ftp.osuosl.org/pub/xiph/releases/"]),
-              ("http://ftp.gnu.org/pub/gnu/", ["https://mirrors.kernel.org/gnu/", "https://mirrors.tuna.tsinghua.edu.cn/gnu/"]),
+              # GNU 官方镜像兜底
+              ("http://ftp.gnu.org/pub/gnu/", [
+                  "https://mirrors.kernel.org/gnu/",
+                  "https://mirrors.tuna.tsinghua.edu.cn/gnu/",
+                  "https://ftpmirror.gnu.org/gnu/",
+              ]),
           ]
+
+          # Blender 官方 SVN 镜像前缀（PACKAGE_USE_UPSTREAM_SOURCES=OFF 时使用）
+          BLENDER_SVN_MIRROR = "https://svn.blender.org/svnroot/bf-blender/trunk/lib/packages/"
 
           tasks = []
           for k, v in variables.items():
@@ -278,17 +291,21 @@ jobs:
                       for mirror in mirrors:
                           urls_to_try.append(mirror + suffix)
 
+              # 添加 Blender SVN 镜像降级兜底
+              urls_to_try.append(BLENDER_SVN_MIRROR + filename)
+
+              # 针对特定包的硬编码兜底
               if "pthreads4w" in filename:
                   urls_to_try.append("https://sourceforge.net/projects/pthreads4w/files/pthreads4w-code-v3.0.0.zip/download")
                   urls_to_try.append("https://downloads.sourceforge.net/project/pthreads4w/pthreads4w-code-v3.0.0.zip")
-              
               if "libpng" in filename:
                   urls_to_try.append("https://downloads.sourceforge.net/project/libpng/libpng16/1.6.58/libpng-1.6.58.tar.xz")
                   urls_to_try.append("https://master.dl.sourceforge.net/project/libpng/libpng16/1.6.58/libpng-1.6.58.tar.xz")
                   urls_to_try.append("https://github.com/pnggroup/libpng/releases/download/v1.6.58/libpng-1.6.58.tar.xz")
 
               for attempt_url in urls_to_try:
-                  cmd = ["curl", "-L", "-4", "-A", "Mozilla/5.0", "-f", "-sS", "--connect-timeout", "15", "-o", dest, attempt_url]
+                  # 关键修复：移除伪造的 Mozilla UA，使用 curl 默认 UA 防止被 Cloudflare 拦截
+                  cmd = ["curl", "-L", "-4", "-f", "-sS", "--connect-timeout", "15", "-o", dest, attempt_url]
                   if subprocess.run(cmd).returncode == 0 and os.path.getsize(dest) > 0:
                       print(f"[OK] {filename} (via {attempt_url})")
                       if filename in KNOWN_SHA256:
@@ -343,7 +360,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/blender-git/blender/lib/linux_arm64
-          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v3
+          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v4
 
       - name: Clean dependencies build artifacts
         if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
@@ -382,7 +399,7 @@ jobs:
             -DCMAKE_C_COMPILER_LAUNCHER=ccache
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
             
-            # 核心修改：强制关闭非必要 GPU 后端
+            # 核心修改：强制关闭所有非必要 GPU 计算后端
             -DWITH_CYCLES_DEVICE_CUDA=OFF
             -DWITH_CYCLES_DEVICE_OPTIX=OFF
             -DWITH_CYCLES_CUDA_BINARIES=OFF
