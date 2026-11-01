@@ -160,7 +160,7 @@ jobs:
         id: cache-deps
         with:
           path: ~/blender-git/blender/lib/linux_arm64
-          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v1
+          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v2
           restore-keys: |
             blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-
 
@@ -219,20 +219,32 @@ jobs:
                   raise RuntimeError(f"SHA256 mismatch for {os.path.basename(filepath)}: expected {expected}, got {actual}")
               print(f"[VERIFY OK] {os.path.basename(filepath)}")
 
-          # 修正了 rubberband 的 GitHub 镜像 tag (添加了 v)
+          # 更新 SourceForge 和 Rubberband 的镜像策略
           MIRROR_RULES = [
+              # GMP 专项
               ("https://gmplib.org/download/gmp/", [
                   "https://ftpmirror.gnu.org/gmp/",
                   "https://mirrors.kernel.org/gnu/gmp/",
                   "https://mirrors.tuna.tsinghua.edu.cn/gnu/gmp/",
               ]),
-              ("http://downloads.sourceforge.net/", ["https://downloads.sourceforge.net/", "https://master.dl.sourceforge.net/project/"]),
-              ("http://prdownloads.sourceforge.net/", ["https://downloads.sourceforge.net/"]),
+              # SourceForge prdownloads 必须映射到 /project/ 路径
+              ("http://prdownloads.sourceforge.net/", [
+                  "https://downloads.sourceforge.net/project/",
+                  "https://master.dl.sourceforge.net/project/",
+              ]),
+              # 旧 SourceForge 路径也映射一遍保证兼容性
+              ("http://downloads.sourceforge.net/", [
+                  "https://downloads.sourceforge.net/",
+                  "https://master.dl.sourceforge.net/",
+              ]),
+              # Rubberband
               ("https://breakfastquay.com/files/releases/", [
                   "https://github.com/breakfastquay/rubberband/releases/download/v4.0.0/",
                   "https://github.com/breakfastquay/rubberband/releases/download/4.0.0/" 
               ]),
+              # Xiph
               ("https://downloads.xiph.org/releases/", ["https://ftp.osuosl.org/pub/xiph/releases/"]),
+              # GNU
               ("http://ftp.gnu.org/pub/gnu/", ["https://mirrors.kernel.org/gnu/", "https://mirrors.tuna.tsinghua.edu.cn/gnu/"]),
           ]
 
@@ -260,8 +272,12 @@ jobs:
                       for mirror in mirrors:
                           urls_to_try.append(mirror + suffix)
 
+              # 针对个别孤儿包添加最终兜底
+              if "pthreads4w" in filename:
+                  urls_to_try.append("https://sourceforge.net/projects/pthreads4w/files/pthreads4w-code-v3.0.0.zip/download")
+                  urls_to_try.append("https://downloads.sourceforge.net/project/pthreads4w/pthreads4w-code-v3.0.0.zip")
+
               for attempt_url in urls_to_try:
-                  # 添加 -A "Mozilla/5.0" 绕过部分站点的防爬虫拦截
                   cmd = ["curl", "-L", "-4", "-A", "Mozilla/5.0", "-f", "-sS", "--connect-timeout", "15", "-o", dest, attempt_url]
                   if subprocess.run(cmd).returncode == 0 and os.path.getsize(dest) > 0:
                       print(f"[OK] {filename} (via {attempt_url})")
@@ -319,7 +335,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/blender-git/blender/lib/linux_arm64
-          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v1
+          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v2
 
       - name: Clean dependencies build artifacts
         if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
