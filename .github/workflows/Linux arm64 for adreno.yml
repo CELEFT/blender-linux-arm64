@@ -1,4 +1,4 @@
-name: Build Blender 5.2.3 ARM64 (Rocky Linux 8)
+name: Build Blender 5.2.3 ARM64 (Rocky Linux 8 - CPU & Vulkan Only)
 
 on:
   workflow_dispatch:
@@ -68,7 +68,8 @@ jobs:
 
           dnf makecache
           retry 10 15 dnf install -y epel-release
-          retry 10 15 dnf install -y git git-lfs gcc-toolset-${{ github.event.inputs.gcc_version }} ccache python3
+          # 补充 Vulkan 相关的开发头文件和工具链
+          retry 10 15 dnf install -y git git-lfs gcc-toolset-${{ github.event.inputs.gcc_version }} ccache python3 vulkan-loader-devel vulkan-headers vulkan-tools || true
 
           mv /usr/bin/sudo /usr/bin/sudo.orig || true
           cat > /usr/bin/sudo << 'EOF'
@@ -232,13 +233,11 @@ jobs:
               print(f"[VERIFY OK] {os.path.basename(filepath)}")
 
           MIRROR_RULES = [
-              # GMP 专项
               ("https://gmplib.org/download/gmp/", [
                   "https://ftpmirror.gnu.org/gmp/",
                   "https://mirrors.kernel.org/gnu/gmp/",
                   "https://mirrors.tuna.tsinghua.edu.cn/gnu/gmp/",
               ]),
-              # SourceForge 标准项目路径
               ("http://prdownloads.sourceforge.net/", [
                   "https://master.dl.sourceforge.net/project/",
                   "https://downloads.sourceforge.net/project/",
@@ -247,14 +246,11 @@ jobs:
                   "https://downloads.sourceforge.net/",
                   "https://master.dl.sourceforge.net/",
               ]),
-              # Rubberband
               ("https://breakfastquay.com/files/releases/", [
                   "https://github.com/breakfastquay/rubberband/releases/download/v4.0.0/",
                   "https://github.com/breakfastquay/rubberband/releases/download/4.0.0/" 
               ]),
-              # Xiph
               ("https://downloads.xiph.org/releases/", ["https://ftp.osuosl.org/pub/xiph/releases/"]),
-              # GNU
               ("http://ftp.gnu.org/pub/gnu/", ["https://mirrors.kernel.org/gnu/", "https://mirrors.tuna.tsinghua.edu.cn/gnu/"]),
           ]
 
@@ -282,7 +278,6 @@ jobs:
                       for mirror in mirrors:
                           urls_to_try.append(mirror + suffix)
 
-              # 针对孤儿包和特殊重定向的终极兜底
               if "pthreads4w" in filename:
                   urls_to_try.append("https://sourceforge.net/projects/pthreads4w/files/pthreads4w-code-v3.0.0.zip/download")
                   urls_to_try.append("https://downloads.sourceforge.net/project/pthreads4w/pthreads4w-code-v3.0.0.zip")
@@ -335,8 +330,6 @@ jobs:
           export CCACHE_DIR=/root/.ccache
           cd ~/blender-git/blender
           
-          export LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
-          export PATH=/usr/local/cuda/bin${PATH:+:${PATH}}
           export LANG=en_US.UTF-8
           
           export CC=/opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/root/usr/bin/gcc
@@ -388,6 +381,21 @@ jobs:
             -DCPACK_SOURCE_TZ=OFF
             -DCMAKE_C_COMPILER_LAUNCHER=ccache
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            
+            # 核心修改：强制关闭非必要 GPU 后端
+            -DWITH_CYCLES_DEVICE_CUDA=OFF
+            -DWITH_CYCLES_DEVICE_OPTIX=OFF
+            -DWITH_CYCLES_CUDA_BINARIES=OFF
+            -DWITH_CYCLES_DEVICE_HIP=OFF
+            -DWITH_CYCLES_DEVICE_METAL=OFF
+            -DWITH_CYCLES_DEVICE_ONEAPI=OFF
+            -DWITH_CUDA_DYNLOAD=OFF
+            
+            # 核心修改：显式开启 CPU 渲染与 Vulkan 后端
+            -DWITH_CYCLES=ON
+            -DWITH_CYCLES_DEVICE_CPU=ON
+            -DWITH_VULKAN_BACKEND=ON
+            -DWITH_OPENGL=ON
           )
 
           if [ "${{ github.event.inputs.build_type }}" == "release" ]; then
@@ -395,7 +403,13 @@ jobs:
           elif [ "${{ github.event.inputs.build_type }}" == "lite" ]; then
             cmake -C ../blender/build_files/cmake/config/blender_lite.cmake "${CMAKE_ARGS[@]}" ../blender
           else
-            CMAKE_ARGS[1]="Debug"
+            # 修复 Debug 模式下的变量替换逻辑
+            for i in "${!CMAKE_ARGS[@]}"; do
+              if [[ "${CMAKE_ARGS[$i]}" == "-DCMAKE_BUILD_TYPE=Release" ]]; then
+                CMAKE_ARGS[$i]="-DCMAKE_BUILD_TYPE=Debug"
+                break
+              fi
+            done
             cmake "${CMAKE_ARGS[@]}" ../blender
           fi
 
