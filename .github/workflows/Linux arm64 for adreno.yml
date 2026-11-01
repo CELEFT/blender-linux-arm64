@@ -31,14 +31,11 @@ jobs:
     env:
       BLENDER_TAG: v5.2.3
       BUILD_JOBS: ${{ inputs.build_jobs }}
-
       SOURCE_DIR: ${{ github.workspace }}/blender
       BUILD_DIR: ${{ github.workspace }}/build_linux
       DIST_DIR: ${{ github.workspace }}/dist
       STAGE_DIR: ${{ github.workspace }}/stage
       PKG_DIR: ${{ github.workspace }}/build_linux/deps_arm64/packages
-      
-      # 启用 ccache 加速主程序编译
       CCACHE_DIR: ${{ github.workspace }}/.ccache
 
     steps:
@@ -131,7 +128,45 @@ jobs:
           git describe --tags --exact-match
 
       # --------------------------------------------------
-      # 3. 多层缓存机制：源码包缓存 + 依赖编译产物缓存 + ccache
+      # 3. 应用 lfdevs 社区 ARM64 补丁
+      # --------------------------------------------------
+      - name: Apply lfdevs ARM64 patches
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$SOURCE_DIR"
+
+          # 浅克隆 lfdevs 补丁仓库
+          git clone --depth 1 --branch ci https://github.com/lfdevs/blender-linux-arm64.git /tmp/lfdevs-patches
+
+          # 优先尝试 v5.1.0 补丁，如果因为代码差异失败则跳过
+          PATCH_DIR="/tmp/lfdevs-patches/patches/v5.1.0"
+          if [ -d "$PATCH_DIR" ]; then
+            for patch in "$PATCH_DIR"/*.patch; do
+              echo "Attempting to apply: $(basename "$patch")"
+              if git apply --check "$patch" 2>/dev/null; then
+                git apply "$patch"
+                echo "Successfully applied: $(basename "$patch")"
+              else
+                echo "Skipping (code mismatch): $(basename "$patch")"
+              fi
+            done
+          fi
+
+          # 强制兜底修复：确保 versions.cmake 在 options.cmake 之后加载
+          # 这是解决 BLENDER_PLATFORM_ARM 未定义导致 OpenSSL 选型错误的关键
+          CMAKE_LIST="build_files/build_environment/CMakeLists.txt"
+          if grep -q "include(cmake/versions.cmake)" "$CMAKE_LIST"; then
+            sed -i '/include(cmake\/versions.cmake)/d' "$CMAKE_LIST"
+            sed -i '/include(cmake\/options.cmake)/a include(cmake/versions.cmake)' "$CMAKE_LIST"
+            echo "Forced include order fix for BLENDER_PLATFORM_ARM."
+          fi
+
+          # 清理旧的 CMake 缓存，防止错误配置被复用
+          rm -rf "$BUILD_DIR/deps_arm64/CMakeCache.txt" "$BUILD_DIR/deps_arm64/CMakeFiles"
+
+      # --------------------------------------------------
+      # 4. 多层缓存机制
       # --------------------------------------------------
       - name: Cache Download Packages
         uses: actions/cache@v4
@@ -157,7 +192,7 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-ccache-
 
       # --------------------------------------------------
-      # 4. 带镜像回退 + SHA256 校验的 Python 预下载
+      # 5. 带镜像回退 + SHA256 校验的 Python 预下载
       # --------------------------------------------------
       - name: Pre-download dependencies concurrently (Python)
         shell: bash
@@ -256,14 +291,13 @@ jobs:
           PYEOF
 
       # --------------------------------------------------
-      # 5. 编译依赖、主程序与打包
+      # 6. 编译依赖、主程序与打包
       # --------------------------------------------------
       - name: Build Blender Dependencies
         shell: bash
         run: |
           set -euxo pipefail
           cd "$SOURCE_DIR"
-          # 如果依赖已通过缓存存在，make deps 会瞬间跳过
           make deps -j"$BUILD_JOBS" \
             DEPS_BUILD_COMMAND="make -s" \
             ARGS="-DPACKAGE_DIR=$PKG_DIR -DPACKAGE_USE_UPSTREAM_SOURCES=OFF"
@@ -273,15 +307,11 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$SOURCE_DIR"
-          
-          # 启用 ccache 加速 C/C++ 编译
           export CCACHE_DIR="${{ env.CCACHE_DIR }}"
           ccache --max-size=4G
           ccache --show-stats
-          
           make config ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
           make -j"$BUILD_JOBS"
-          
           ccache --show-stats
 
       - name: Package Blender
@@ -295,7 +325,7 @@ jobs:
           ls -lh "$DIST_DIR"
 
       # --------------------------------------------------
-      # 6. 产物上传与发布
+      # 7. 产物上传与发布
       # --------------------------------------------------
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
