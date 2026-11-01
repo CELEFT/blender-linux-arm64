@@ -155,12 +155,24 @@ jobs:
           echo "Cleaning dnf cache..."
           dnf clean all
 
+      # --------------------------------------------------
+      # 缓存机制：源码包缓存、编译产物缓存、ccache
+      # --------------------------------------------------
+      - name: Cache Download Packages
+        uses: actions/cache@v4
+        id: cache-pkgs
+        with:
+          path: ~/blender-git/build_linux/deps_arm64/packages
+          key: blender-pkgs-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v3
+          restore-keys: |
+            blender-pkgs-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-
+
       - name: Cache Blender dependencies
         uses: actions/cache@v4
         id: cache-deps
         with:
           path: ~/blender-git/blender/lib/linux_arm64
-          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v2
+          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v3
           restore-keys: |
             blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-
 
@@ -219,7 +231,6 @@ jobs:
                   raise RuntimeError(f"SHA256 mismatch for {os.path.basename(filepath)}: expected {expected}, got {actual}")
               print(f"[VERIFY OK] {os.path.basename(filepath)}")
 
-          # 更新 SourceForge 和 Rubberband 的镜像策略
           MIRROR_RULES = [
               # GMP 专项
               ("https://gmplib.org/download/gmp/", [
@@ -227,12 +238,11 @@ jobs:
                   "https://mirrors.kernel.org/gnu/gmp/",
                   "https://mirrors.tuna.tsinghua.edu.cn/gnu/gmp/",
               ]),
-              # SourceForge prdownloads 必须映射到 /project/ 路径
+              # SourceForge 标准项目路径
               ("http://prdownloads.sourceforge.net/", [
-                  "https://downloads.sourceforge.net/project/",
                   "https://master.dl.sourceforge.net/project/",
+                  "https://downloads.sourceforge.net/project/",
               ]),
-              # 旧 SourceForge 路径也映射一遍保证兼容性
               ("http://downloads.sourceforge.net/", [
                   "https://downloads.sourceforge.net/",
                   "https://master.dl.sourceforge.net/",
@@ -272,10 +282,15 @@ jobs:
                       for mirror in mirrors:
                           urls_to_try.append(mirror + suffix)
 
-              # 针对个别孤儿包添加最终兜底
+              # 针对孤儿包和特殊重定向的终极兜底
               if "pthreads4w" in filename:
                   urls_to_try.append("https://sourceforge.net/projects/pthreads4w/files/pthreads4w-code-v3.0.0.zip/download")
                   urls_to_try.append("https://downloads.sourceforge.net/project/pthreads4w/pthreads4w-code-v3.0.0.zip")
+              
+              if "libpng" in filename:
+                  urls_to_try.append("https://downloads.sourceforge.net/project/libpng/libpng16/1.6.58/libpng-1.6.58.tar.xz")
+                  urls_to_try.append("https://master.dl.sourceforge.net/project/libpng/libpng16/1.6.58/libpng-1.6.58.tar.xz")
+                  urls_to_try.append("https://github.com/pnggroup/libpng/releases/download/v1.6.58/libpng-1.6.58.tar.xz")
 
               for attempt_url in urls_to_try:
                   cmd = ["curl", "-L", "-4", "-A", "Mozilla/5.0", "-f", "-sS", "--connect-timeout", "15", "-o", dest, attempt_url]
@@ -335,7 +350,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/blender-git/blender/lib/linux_arm64
-          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v2
+          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v3
 
       - name: Clean dependencies build artifacts
         if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
