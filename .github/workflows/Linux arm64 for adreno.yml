@@ -226,10 +226,25 @@ jobs:
 
           with open(versions_file) as f:
               content = f.read()
+          
+          # 去除注释行，防止正则误匹配
+          content = re.sub(r'#.*', '', content)
 
-          versions = dict(re.findall(r'set\((\w+)_VERSION\s+([^\)]+)\)', content))
-          uris = re.findall(r'set\((\w+)_URI\s+([^\)]+)\)', content)
-          files = dict(re.findall(r'set\((\w+)_FILE\s+([^\)]+)\)', content))
+          # 匹配所有的 set(VAR VALUE)
+          matches = re.findall(r'set\(\s*(\w+)\s+["\']?([^"\'\n]+)["\']?\s*\)', content)
+          variables = {k: v.strip() for k, v in matches}
+
+          def resolve(text):
+              # 循环 10 次以解决嵌套变量引用问题
+              for _ in range(10):
+                  if "${" not in text:
+                      break
+                  for k, v in variables.items():
+                      text = text.replace("${" + k + "}", v)
+              return text
+
+          uris = re.findall(r'set\((\w+_URI)\s+([^\)]+)\)', content)
+          files = dict(re.findall(r'set\((\w+_FILE)\s+([^\)]+)\)', content))
 
           def download(url, dest):
               if os.path.exists(dest) and os.path.getsize(dest) > 0:
@@ -239,7 +254,8 @@ jobs:
               retries = 5
               for i in range(retries):
                   try:
-                      subprocess.run(["curl", "-L", "--connect-timeout", "15", "--retry", "3", "-s", "-o", dest, url], check=True)
+                      # -4 强制 IPv4，-sS 静默但显示错误，--retry 3 是 curl 自带的重试
+                      subprocess.run(["curl", "-L", "-4", "--connect-timeout", "20", "--retry", "3", "-sS", "-o", dest, url], check=True)
                       if os.path.getsize(dest) > 0:
                           print(f"Success: {os.path.basename(dest)}")
                           return
@@ -252,11 +268,8 @@ jobs:
           for name, uri in uris:
               if name not in files:
                   continue
-              final_uri = uri
-              final_file = files[name]
-              for var_name, var_val in versions.items():
-                  final_uri = final_uri.replace("${" + var_name + "}", var_val)
-                  final_file = final_file.replace("${" + var_name + "}", var_val)
+              final_uri = resolve(uri)
+              final_file = resolve(files[name])
               
               dest = os.path.join(pkg_dir, final_file)
               download(final_uri, dest)
@@ -273,7 +286,6 @@ jobs:
           set -euxo pipefail
           cd "$SOURCE_DIR"
           
-          # 显式指定 PACKAGE_DIR，使 CMake 优先从我们预下载的本地目录读取
           make deps -j"$BUILD_JOBS" ARGS="-DPACKAGE_DIR=$PKG_DIR"
 
       # --------------------------------------------------
