@@ -226,7 +226,7 @@ jobs:
 
           with open(versions_file) as f:
               content = f.read()
-          
+
           # 去除注释行，防止正则误匹配
           content = re.sub(r'#.*', '', content)
 
@@ -243,38 +243,45 @@ jobs:
                       text = text.replace("${" + k + "}", v)
               return text
 
-          uris = re.findall(r'set\((\w+_URI)\s+([^\)]+)\)', content)
-          files = dict(re.findall(r'set\((\w+_FILE)\s+([^\)]+)\)', content))
+          downloads = {}
+          for k, v in variables.items():
+              if k.endswith("_URI"):
+                  base_name = k[:-4] # 去掉 _URI
+                  file_key = base_name + "_FILE"
+                  if file_key in variables:
+                      downloads[base_name] = (resolve(v), resolve(variables[file_key]))
 
           def download(url, dest):
               if os.path.exists(dest) and os.path.getsize(dest) > 0:
                   print(f"Already exists: {os.path.basename(dest)}")
-                  return
+                  return True
               print(f"Downloading {url} -> {dest}")
               retries = 5
               for i in range(retries):
                   try:
-                      # -4 强制 IPv4，-sS 静默但显示错误，--retry 3 是 curl 自带的重试
-                      subprocess.run(["curl", "-L", "-4", "--connect-timeout", "20", "--retry", "3", "-sS", "-o", dest, url], check=True)
+                      # -4 强制 IPv4, -f 遇到 HTTP 错误直接失败, -sS 静默但打印错误, --retry 3 curl自带重试
+                      subprocess.run(["curl", "-L", "-4", "-f", "--connect-timeout", "20", "--retry", "3", "-sS", "-o", dest, url], check=True)
                       if os.path.getsize(dest) > 0:
                           print(f"Success: {os.path.basename(dest)}")
-                          return
+                          return True
                   except subprocess.CalledProcessError:
                       print(f"Attempt {i+1} failed for {url}, retrying in 5s...")
                       time.sleep(5)
               print(f"ERROR: Failed to download {url} after {retries} attempts.")
-              sys.exit(1)
+              return False
 
-          for name, uri in uris:
-              if name not in files:
-                  continue
-              final_uri = resolve(uri)
-              final_file = resolve(files[name])
-              
-              dest = os.path.join(pkg_dir, final_file)
-              download(final_uri, dest)
-              
-          print("All dependencies downloaded successfully.")
+          success = True
+          for name, (url, filename) in downloads.items():
+              dest = os.path.join(pkg_dir, filename)
+              if not download(url, dest):
+                  success = False
+
+          if not success:
+              sys.exit(1)
+          else:
+              print(f"All dependencies downloaded successfully to {pkg_dir}.")
+              for f in os.listdir(pkg_dir):
+                  print(f" - {f}")
           PYEOF
 
       # --------------------------------------------------
@@ -286,7 +293,8 @@ jobs:
           set -euxo pipefail
           cd "$SOURCE_DIR"
           
-          make deps -j"$BUILD_JOBS" ARGS="-DPACKAGE_DIR=$PKG_DIR"
+          # 强制 CMake 使用本地目录，禁止联网下载
+          make deps -j"$BUILD_JOBS" ARGS="-DPACKAGE_DIR=$PKG_DIR -DPACKAGE_USE_UPSTREAM_SOURCES=OFF"
 
       # --------------------------------------------------
       # 11. Build Blender
