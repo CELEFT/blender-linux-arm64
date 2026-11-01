@@ -40,37 +40,28 @@ jobs:
 
     steps:
       # --------------------------------------------------
-      # 1. Validate parameters
+      # 1. 校验参数与环境
       # --------------------------------------------------
       - name: Validate build parameters
         shell: bash
         run: |
           set -euxo pipefail
-
           if [[ ! "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]]; then
             echo "Invalid BUILD_JOBS: $BUILD_JOBS"
             exit 1
           fi
-
           if [ "$(uname -m)" != "aarch64" ]; then
             echo "This workflow requires a native ARM64 runner."
             uname -a
             exit 1
           fi
+          echo "Build jobs: $BUILD_JOBS, Architecture: $(uname -m)"
 
-          echo "Build jobs: $BUILD_JOBS"
-          echo "Architecture: $(uname -m)"
-
-      # --------------------------------------------------
-      # 2. Install system dependencies
-      # --------------------------------------------------
       - name: Install system dependencies
         shell: bash
         run: |
           set -euxo pipefail
-
           apt-get update
-
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential gcc g++ cmake ninja-build make pkg-config \
             git git-lfs subversion curl wget ca-certificates file patchelf rsync \
@@ -88,119 +79,56 @@ jobs:
             libudev-dev libopenal-dev libpulse-dev libjack-jackd2-dev libsndfile1-dev \
             libjpeg-dev libpng-dev libtiff-dev libwebp-dev libopenjp2-7-dev \
             libavif-dev libtbb-dev libjemalloc-dev
-
           git lfs install
 
       # --------------------------------------------------
-      # 3. Verify environment
-      # --------------------------------------------------
-      - name: Verify ARM64 environment
-        shell: bash
-        run: |
-          set -euxo pipefail
-          uname -a
-          dpkg --print-architecture
-          gcc --version
-          cmake --version
-          python3 --version
-          test "$(dpkg --print-architecture)" = "arm64"
-
-      - name: Verify dependency build tools
-        shell: bash
-        run: |
-          set -euxo pipefail
-          for tool in cmake ninja gcc g++ make git curl python3 tclsh autopoint help2man meson nasm yasm; do
-            command -v "$tool"
-          done
-
-      # --------------------------------------------------
-      # 4. Fix MD5 for OpenSSL 3 (Debian 13 / trixie)
+      # 2. 环境修复与源码缓存
       # --------------------------------------------------
       - name: Fix hashlib MD5 for OpenSSL 3 strict mode
         shell: bash
         run: |
           set -euxo pipefail
-
           SITE_DIR="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
-          echo "Python site-packages: $SITE_DIR"
-
           SITECUSTOMIZE="$SITE_DIR/sitecustomize.py"
-
-          if [ -f "$SITECUSTOMIZE" ]; then
-            cp "$SITECUSTOMIZE" "$SITECUSTOMIZE.bak"
-          fi
-
+          [ -f "$SITECUSTOMIZE" ] && cp "$SITECUSTOMIZE" "$SITECUSTOMIZE.bak"
           cat > "$SITECUSTOMIZE" <<'PYEOF'
           import hashlib
-
           _original_md5 = hashlib.md5
-
           def md5(*args, **kwargs):
               kwargs.setdefault("usedforsecurity", False)
               return _original_md5(*args, **kwargs)
-
           hashlib.md5 = md5
           PYEOF
+          python3 -c "import hashlib; hashlib.md5(b'test')"
 
-          echo "--- sitecustomize.py ---"
-          cat "$SITECUSTOMIZE"
-
-          python3 -c "import hashlib; print('MD5 OK:', hashlib.md5(b'blender').hexdigest())"
-
-      # --------------------------------------------------
-      # 5. Configure Git LFS
-      # --------------------------------------------------
       - name: Configure Git LFS
         shell: bash
         run: |
-          set -euxo pipefail
           git config --global url."https://projects.blender.org/".insteadOf "https://git.blender.org/"
           git lfs install
 
-      # --------------------------------------------------
-      # 6. Cache Blender source repository
-      # --------------------------------------------------
       - name: Cache Blender source repository
         uses: actions/cache@v4
         with:
           path: blender
           key: ${{ runner.os }}-${{ runner.arch }}-blender-source-${{ env.BLENDER_TAG }}
 
-      # --------------------------------------------------
-      # 7. Checkout Blender source
-      # --------------------------------------------------
-      - name: Checkout Blender 5.2.3 source
+      - name: Checkout Blender source
         shell: bash
         run: |
           set -euxo pipefail
-
           if [ -d "$SOURCE_DIR/.git" ]; then
-            CURRENT_TAG="$(
-              git -C "$SOURCE_DIR" describe \
-                --tags \
-                --exact-match 2>/dev/null || true
-            )"
-            if [ "$CURRENT_TAG" != "$BLENDER_TAG" ]; then
-              rm -rf "$SOURCE_DIR"
-            fi
+            CURRENT_TAG="$(git -C "$SOURCE_DIR" describe --tags --exact-match 2>/dev/null || true)"
+            if [ "$CURRENT_TAG" != "$BLENDER_TAG" ]; then rm -rf "$SOURCE_DIR"; fi
           fi
-
           if [ ! -d "$SOURCE_DIR/.git" ]; then
-            git clone \
-              --depth 1 \
-              --branch "$BLENDER_TAG" \
-              https://projects.blender.org/blender/blender.git \
-              "$SOURCE_DIR"
+            git clone --depth 1 --branch "$BLENDER_TAG" https://projects.blender.org/blender/blender.git "$SOURCE_DIR"
           fi
-
-          cd "$SOURCE_DIR"
-          git lfs pull
-          echo "Blender version:"
+          cd "$SOURCE_DIR" && git lfs pull
           git describe --tags --exact-match
-          git log -1 --oneline
 
       # --------------------------------------------------
-      # 8. Cache Dependencies Packages
+      # 3. 优雅的 Python 预下载与缓存
       # --------------------------------------------------
       - name: Cache Blender Dependencies Packages
         uses: actions/cache@v4
@@ -208,125 +136,94 @@ jobs:
           path: ${{ env.PKG_DIR }}
           key: ${{ runner.os }}-${{ runner.arch }}-blender-deps-packages-${{ env.BLENDER_TAG }}
 
-      # --------------------------------------------------
-      # 9. Pre-download Dependencies with Retry
-      # --------------------------------------------------
-      - name: Pre-download dependencies with retry
+      - name: Pre-download dependencies concurrently (Python)
         shell: bash
         run: |
           set -euxo pipefail
           cd "$SOURCE_DIR"
           
           python3 << 'PYEOF'
-          import re, os, subprocess, sys, time
+          import re, os, subprocess, concurrent.futures
+          
+          VERSIONS_FILE = "build_files/build_environment/cmake/versions.cmake"
+          PKG_DIR = os.environ.get("PKG_DIR")
+          os.makedirs(PKG_DIR, exist_ok=True)
 
-          versions_file = "build_files/build_environment/cmake/versions.cmake"
-          pkg_dir = os.environ.get("PKG_DIR")
-          os.makedirs(pkg_dir, exist_ok=True)
-
-          with open(versions_file) as f:
+          with open(VERSIONS_FILE) as f:
               content = f.read()
 
-          # 去除注释行，防止正则误匹配
-          content = re.sub(r'#.*', '', content)
-
-          # 匹配所有的 set(VAR VALUE)
-          matches = re.findall(r'set\(\s*(\w+)\s+["\']?([^"\'\n]+)["\']?\s*\)', content)
+          # 提取所有 set(VAR VALUE) 键值对
+          matches = re.findall(r'set\(\s*(\w+)\s+["\']?([^"\'\n\)]+)["\']?\s*\)', content)
           variables = {k: v.strip() for k, v in matches}
 
           def resolve(text):
-              # 循环 10 次以解决嵌套变量引用问题
               for _ in range(10):
-                  if "${" not in text:
-                      break
+                  if "${" not in text: break
                   for k, v in variables.items():
                       text = text.replace("${" + k + "}", v)
               return text
 
-          downloads = {}
+          # 找出所有需要下载的 URI 和对应的文件
+          tasks = []
           for k, v in variables.items():
               if k.endswith("_URI"):
-                  base_name = k[:-4] # 去掉 _URI
-                  file_key = base_name + "_FILE"
+                  base = k[:-4]
+                  file_key = base + "_FILE"
                   if file_key in variables:
-                      downloads[base_name] = (resolve(v), resolve(variables[file_key]))
+                      url = resolve(v)
+                      filename = resolve(variables[file_key])
+                      tasks.append((url, os.path.join(PKG_DIR, filename)))
 
           def download(url, dest):
               if os.path.exists(dest) and os.path.getsize(dest) > 0:
-                  print(f"Already exists: {os.path.basename(dest)}")
-                  return True
-              print(f"Downloading {url} -> {dest}")
-              retries = 5
-              for i in range(retries):
-                  try:
-                      # -4 强制 IPv4, -f 遇到 HTTP 错误直接失败, -sS 静默但打印错误, --retry 3 curl自带重试
-                      subprocess.run(["curl", "-L", "-4", "-f", "--connect-timeout", "20", "--retry", "3", "-sS", "-o", dest, url], check=True)
-                      if os.path.getsize(dest) > 0:
-                          print(f"Success: {os.path.basename(dest)}")
-                          return True
-                  except subprocess.CalledProcessError:
-                      print(f"Attempt {i+1} failed for {url}, retrying in 5s...")
-                      time.sleep(5)
-              print(f"ERROR: Failed to download {url} after {retries} attempts.")
-              return False
+                  print(f"[SKIP] {os.path.basename(dest)}")
+                  return
+              print(f"[FETCH] {url}")
+              # 强制 IPv4, 失败重试 3 次, 超时 30 秒
+              cmd = ["curl", "-L", "-4", "-f", "-sS", "--retry", "3", "--connect-timeout", "30", "-o", dest, url]
+              if subprocess.run(cmd).returncode != 0:
+                  raise RuntimeError(f"Failed to download {url}")
 
-          success = True
-          for name, (url, filename) in downloads.items():
-              dest = os.path.join(pkg_dir, filename)
-              if not download(url, dest):
-                  success = False
+          # 使用线程池并发下载，加快速度
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+              futures = [executor.submit(download, url, dest) for url, dest in tasks]
+              for future in concurrent.futures.as_completed(futures):
+                  future.result() # 触发异常中断
 
-          if not success:
-              sys.exit(1)
-          else:
-              print(f"All dependencies downloaded successfully to {pkg_dir}.")
-              for f in os.listdir(pkg_dir):
-                  print(f" - {f}")
+          print(f"\nAll dependencies ready in {PKG_DIR}")
           PYEOF
 
       # --------------------------------------------------
-      # 10. Build Blender dependencies
+      # 4. 编译依赖、主程序与打包
       # --------------------------------------------------
       - name: Build Blender Dependencies
         shell: bash
         run: |
           set -euxo pipefail
           cd "$SOURCE_DIR"
-          
-          # 强制 CMake 使用本地目录，禁止联网下载
+          # 强制只使用本地预下载缓存，彻底断网
           make deps -j"$BUILD_JOBS" ARGS="-DPACKAGE_DIR=$PKG_DIR -DPACKAGE_USE_UPSTREAM_SOURCES=OFF"
 
-      # --------------------------------------------------
-      # 11. Build Blender
-      # --------------------------------------------------
       - name: Build Blender
         shell: bash
         run: |
           set -euxo pipefail
           cd "$SOURCE_DIR"
-          
           make config
           make -j"$BUILD_JOBS"
 
-      # --------------------------------------------------
-      # 12. Package Blender
-      # --------------------------------------------------
       - name: Package Blender
         shell: bash
         run: |
           set -euxo pipefail
           cd "$SOURCE_DIR"
-          
           make package
-          
           mkdir -p "$DIST_DIR"
           find "$BUILD_DIR" -name "*.tar.*" -exec cp {} "$DIST_DIR/" \;
-          
-          echo "Generated packages:"
           ls -lh "$DIST_DIR"
 
       # --------------------------------------------------
-      # 13. Upload Artifacts
+      # 5. 产物上传与发布
       # --------------------------------------------------
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
@@ -335,16 +232,11 @@ jobs:
           path: ${{ env.DIST_DIR }}/*.tar.*
           if-no-files-found: error
 
-      # --------------------------------------------------
-      # 14. Publish Release (Optional)
-      # --------------------------------------------------
       - name: Publish GitHub Release
         if: ${{ inputs.publish_release }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.BLENDER_TAG }}-arm64
           name: Blender ${{ env.BLENDER_TAG }} (Linux ARM64)
-          body: |
-            Automated build of Blender ${{ env.BLENDER_TAG }} for Linux ARM64 (Debian 13 / trixie).
           files: ${{ env.DIST_DIR }}/*.tar.*
           token: ${{ secrets.GITHUB_TOKEN }}
