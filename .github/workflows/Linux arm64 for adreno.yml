@@ -1,16 +1,36 @@
-name: Build Blender 5.2.3 ARM64 Debian 13
+name: Build Blender 5.2.3 ARM64 (Rocky Linux 8)
 
 on:
   workflow_dispatch:
     inputs:
-      build_jobs:
-        description: "Parallel build jobs"
+      blender_version:
+        description: 'Blender version tag'
         required: true
-        default: "4"
-        type: string
-
-      publish_release:
-        description: "Publish the result as a GitHub Release"
+        default: 'v5.2.3'
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - lite
+          - debug
+      gcc_version:
+        description: 'GCC version'
+        required: true
+        default: '14'
+        type: choice
+        options:
+          - 14
+          - 11
+      rebuild_deps:
+        description: 'Force rebuild dependencies'
+        required: false
+        default: false
+        type: boolean
+      draft_release:
+        description: 'Draft a new release'
         required: true
         default: false
         type: boolean
@@ -20,332 +40,351 @@ permissions:
 
 jobs:
   build:
-    name: Build Blender 5.2.3 for ARM64
-    runs-on: ubuntu-26.04-arm
-
+    runs-on: ubuntu-24.04-arm
     container:
-      image: debian:trixie
-
-    timeout-minutes: 480
-
-    env:
-      BLENDER_TAG: v5.2.3
-      BUILD_JOBS: ${{ inputs.build_jobs }}
-      SOURCE_DIR: ${{ github.workspace }}/blender
-      BUILD_DIR: ${{ github.workspace }}/build_linux
-      DIST_DIR: ${{ github.workspace }}/dist
-      STAGE_DIR: ${{ github.workspace }}/stage
-      PKG_DIR: ${{ github.workspace }}/build_linux/deps_arm64/packages
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      image: rockylinux:8
+      options: --privileged --user root
 
     steps:
-      # --------------------------------------------------
-      # 1. 校验参数与环境
-      # --------------------------------------------------
-      - name: Validate build parameters
+      - name: Install base dependencies
         shell: bash
         run: |
-          set -euxo pipefail
-          if [[ ! "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]]; then
-            echo "Invalid BUILD_JOBS: $BUILD_JOBS"
-            exit 1
-          fi
-          if [ "$(uname -m)" != "aarch64" ]; then
-            echo "This workflow requires a native ARM64 runner."
-            uname -a
-            exit 1
-          fi
-          echo "Build jobs: $BUILD_JOBS, Architecture: $(uname -m)"
-
-      - name: Install system dependencies
-        shell: bash
-        run: |
-          set -euxo pipefail
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            build-essential gcc g++ cmake ninja-build make pkg-config ccache \
-            git git-lfs subversion curl wget ca-certificates file patchelf rsync \
-            unzip zip xz-utils zstd tar bzip2 patch perl gawk m4 autoconf automake \
-            autopoint libtool gettext help2man texinfo tcl meson flex bison yasm nasm \
-            python3 python3-dev python3-venv python3-pip python3-mako python3-yaml \
-            python3-setuptools python3-wheel libssl-dev libffi-dev libxml2-dev \
-            libzstd-dev liblzma-dev libbz2-dev libreadline-dev libncurses-dev \
-            libsqlite3-dev libtinfo-dev libfontconfig1-dev libfreetype-dev \
-            libharfbuzz-dev libfribidi-dev libx11-dev libxext-dev libxrender-dev \
-            libxfixes-dev libxi-dev libxinerama-dev libxcursor-dev libxrandr-dev \
-            libxxf86vm-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            wayland-protocols libegl-dev libgl-dev libglu1-mesa-dev libvulkan-dev \
-            libdrm-dev libgbm-dev libepoxy-dev libosmesa6-dev libdbus-1-dev \
-            libudev-dev libopenal-dev libpulse-dev libjack-jackd2-dev libsndfile1-dev \
-            libjpeg-dev libpng-dev libtiff-dev libwebp-dev libopenjp2-7-dev \
-            libavif-dev libtbb-dev libjemalloc-dev
-          git lfs install
-
-      # --------------------------------------------------
-      # 2. 环境修复与源码缓存
-      # --------------------------------------------------
-      - name: Fix hashlib MD5 for OpenSSL 3 strict mode
-        shell: bash
-        run: |
-          set -euxo pipefail
-          SITE_DIR="$(python3 -c 'import site; print(site.getsitepackages()[0])')"
-          SITECUSTOMIZE="$SITE_DIR/sitecustomize.py"
-          [ -f "$SITECUSTOMIZE" ] && cp "$SITECUSTOMIZE" "$SITECUSTOMIZE.bak"
-          cat > "$SITECUSTOMIZE" <<'PYEOF'
-          import hashlib
-          _original_md5 = hashlib.md5
-          def md5(*args, **kwargs):
-              kwargs.setdefault("usedforsecurity", False)
-              return _original_md5(*args, **kwargs)
-          hashlib.md5 = md5
-          PYEOF
-          python3 -c "import hashlib; hashlib.md5(b'test')"
-
-      - name: Configure Git LFS
-        shell: bash
-        run: |
-          git config --global url."https://projects.blender.org/".insteadOf "https://git.blender.org/"
-          git lfs install
-
-      - name: Cache Blender source repository
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.SOURCE_DIR }}
-          key: ${{ runner.os }}-${{ runner.arch }}-blender-source-${{ env.BLENDER_TAG }}
-
-      - name: Checkout Blender source
-        shell: bash
-        run: |
-          set -euxo pipefail
-          if [ -d "$SOURCE_DIR/.git" ]; then
-            CURRENT_TAG="$(git -C "$SOURCE_DIR" describe --tags --exact-match 2>/dev/null || true)"
-            if [ "$CURRENT_TAG" != "$BLENDER_TAG" ]; then rm -rf "$SOURCE_DIR"; fi
-          fi
-          if [ ! -d "$SOURCE_DIR/.git" ]; then
-            git clone --depth 1 --branch "$BLENDER_TAG" https://projects.blender.org/blender/blender.git "$SOURCE_DIR"
-          fi
-          cd "$SOURCE_DIR" && git lfs pull
-          git describe --tags --exact-match
-
-      # --------------------------------------------------
-      # 3. 应用 lfdevs 社区 ARM64 补丁
-      # --------------------------------------------------
-      - name: Apply lfdevs ARM64 patches
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$SOURCE_DIR"
-
-          git clone --depth 1 --branch ci https://github.com/lfdevs/blender-linux-arm64.git /tmp/lfdevs-patches
-
-          PATCH_DIR="/tmp/lfdevs-patches/patches/v5.1.0"
-          if [ -d "$PATCH_DIR" ]; then
-            for patch in "$PATCH_DIR"/*.patch; do
-              echo "Attempting to apply: $(basename "$patch")"
-              if git apply --check "$patch" 2>/dev/null; then
-                git apply "$patch"
-                echo "Successfully applied: $(basename "$patch")"
-              else
-                echo "Skipping (code mismatch): $(basename "$patch")"
+          retry() {
+            local max_attempts="$1"
+            local delay_seconds="$2"
+            shift 2
+            local attempt=1
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Command failed after ${max_attempts} attempts: $*"
+                return 1
               fi
+              echo "Attempt ${attempt}/${max_attempts} failed: $*"
+              echo "Retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              attempt=$((attempt + 1))
             done
-          fi
-
-      # --------------------------------------------------
-      # 4. 多层缓存机制
-      # --------------------------------------------------
-      - name: Cache Download Packages
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.PKG_DIR }}
-          key: ${{ runner.os }}-${{ runner.arch }}-blender-deps-packages-${{ env.BLENDER_TAG }}
-
-      - name: Cache Compiled Dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ env.BUILD_DIR }}/deps_arm64
-            ${{ env.SOURCE_DIR }}/lib
-          key: ${{ runner.os }}-${{ runner.arch }}-blender-deps-build-${{ env.BLENDER_TAG }}-${{ hashFiles('blender/build_files/build_environment/cmake/versions.cmake') }}
-
-      - name: Cache ccache for Blender Build
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ${{ runner.os }}-${{ runner.arch }}-ccache-${{ env.BLENDER_TAG }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-ccache-${{ env.BLENDER_TAG }}-
-            ${{ runner.os }}-${{ runner.arch }}-ccache-
-
-      # --------------------------------------------------
-      # 5. 带镜像回退 + SHA256 校验的 Python 预下载
-      # --------------------------------------------------
-      - name: Pre-download dependencies concurrently (Python)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          cd "$SOURCE_DIR"
-          
-          python3 << 'PYEOF'
-          import re, os, subprocess, concurrent.futures, hashlib
-          
-          VERSIONS_FILE = "build_files/build_environment/cmake/versions.cmake"
-          PKG_DIR = os.environ.get("PKG_DIR")
-          os.makedirs(PKG_DIR, exist_ok=True)
-
-          with open(VERSIONS_FILE) as f:
-              content = f.read()
-
-          matches = re.findall(r'set\(\s*(\w+)\s+["\']?([^"\'\n\)]+)["\']?\s*\)', content)
-          variables = {k: v.strip() for k, v in matches}
-
-          def resolve(text):
-              for _ in range(10):
-                  if "${" not in text: break
-                  for k, v in variables.items():
-                      text = text.replace("${" + k + "}", v)
-              return text
-
-          KNOWN_SHA256 = {
-              "gmp-6.3.0.tar.xz": "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898",
           }
 
-          def verify_sha256(filepath, expected):
-              h = hashlib.sha256()
-              with open(filepath, "rb") as f:
-                  for chunk in iter(lambda: f.read(65536), b""):
-                      h.update(chunk)
-              actual = h.hexdigest()
-              if actual != expected:
-                  raise RuntimeError(f"SHA256 mismatch for {os.path.basename(filepath)}: expected {expected}, got {actual}")
-              print(f"[VERIFY OK] {os.path.basename(filepath)}")
+          dnf makecache
+          retry 10 15 dnf install -y epel-release
+          retry 10 15 dnf install -y git git-lfs gcc-toolset-${{ github.event.inputs.gcc_version }} ccache
 
-          MIRROR_RULES = [
-              ("https://gmplib.org/download/gmp/", [
-                  "https://ftpmirror.gnu.org/gmp/",
-                  "https://mirrors.hust.edu.cn/gnu/gmp/",
-                  "https://www.mirrorservice.org/sites/ftp.gnu.org/gnu/gmp/",
-                  "https://mirrors.tuna.tsinghua.edu.cn/gnu/gmp/",
-              ]),
-              ("http://downloads.sourceforge.net/", ["https://downloads.sourceforge.net/", "https://master.dl.sourceforge.net/project/"]),
-              ("http://prdownloads.sourceforge.net/", ["https://downloads.sourceforge.net/"]),
-              ("https://breakfastquay.com/files/releases/", ["https://github.com/breakfastquay/rubberband/releases/download/4.0.0/"]),
-              ("https://downloads.xiph.org/releases/", ["https://ftp.osuosl.org/pub/xiph/releases/"]),
-              ("http://ftp.gnu.org/pub/gnu/", ["https://mirrors.kernel.org/gnu/", "https://mirrors.tuna.tsinghua.edu.cn/gnu/"]),
-          ]
+          # 绕过容器内 sudo 的 TTY 认证限制
+          mv /usr/bin/sudo /usr/bin/sudo.orig || true
+          cat > /usr/bin/sudo << 'EOF'
+          #!/bin/bash
+          if [ "$1" = "-y" ] || [ "$1" = "-n" ] || [ "$1" = "-E" ]; then
+            shift
+          fi
+          exec "$@"
+          EOF
+          chmod +x /usr/bin/sudo
 
-          tasks = []
-          for k, v in variables.items():
-              if k.endswith("_URI"):
-                  base = k[:-4]
-                  file_key = base + "_FILE"
-                  if file_key in variables:
-                      url = resolve(v)
-                      filename = resolve(variables[file_key])
-                      tasks.append((url, os.path.join(PKG_DIR, filename), filename))
+      - name: Setup Git LFS
+        run: git-lfs install
 
-          def download(url, dest, filename):
-              if os.path.exists(dest) and os.path.getsize(dest) > 0:
-                  print(f"[SKIP] {filename}")
-                  if filename in KNOWN_SHA256:
-                      verify_sha256(dest, KNOWN_SHA256[filename])
-                  return
+      - name: Clone Blender repository
+        run: |
+          mkdir -p ~/blender-git
+          cd ~/blender-git
+          git clone -b ${{ github.event.inputs.blender_version }} --single-branch --depth 1 https://projects.blender.org/blender/blender.git
 
-              urls_to_try = [url]
-              for prefix, mirrors in MIRROR_RULES:
-                  if url.startswith(prefix):
-                      suffix = url[len(prefix):]
-                      for mirror in mirrors:
-                          urls_to_try.append(mirror + suffix)
+      - name: Clone patches repository
+        run: |
+          cd ~/blender-git
+          # 优先尝试克隆你的 patches-repo，如果没配则 fallback 到 lfdevs
+          if ! git clone -b ci --depth 1 ${{ github.server_url }}/${{ github.repository }}.git patches-repo 2>/dev/null; then
+            echo "Failed to clone own repo, falling back to lfdevs community patches..."
+            git clone -b ci --depth 1 https://github.com/lfdevs/blender-linux-arm64.git patches-repo
+          fi
 
-              for attempt_url in urls_to_try:
-                  cmd = ["curl", "-L", "-4", "-f", "-sS", "--connect-timeout", "10", "-o", dest, attempt_url]
-                  if subprocess.run(cmd).returncode == 0 and os.path.getsize(dest) > 0:
-                      print(f"[OK] {filename} (via {attempt_url})")
-                      if filename in KNOWN_SHA256:
-                          verify_sha256(dest, KNOWN_SHA256[filename])
-                      return
+      - name: Apply patches
+        run: |
+          cd ~/blender-git/blender
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          
+          PATCH_DIR=~/blender-git/patches-repo/patches/${{ github.event.inputs.blender_version }}
+          if [ -d "$PATCH_DIR" ]; then
+            echo "Found patches directory: $PATCH_DIR"
+            for patch in $(ls -1 "$PATCH_DIR"/*.patch 2>/dev/null | sort); do
+              echo "Applying patch: $patch"
+              git apply --verbose "$patch" || echo "Patch failed, skipping..."
+            done
+            git add -A
+            git commit -m "Apply patches for ${{ github.event.inputs.blender_version }}" || echo "No changes to commit"
+          else
+            echo "No patches directory found for ${{ github.event.inputs.blender_version }}, trying v5.1.0..."
+            FALLBACK_DIR=~/blender-git/patches-repo/patches/v5.1.0
+            if [ -d "$FALLBACK_DIR" ]; then
+              for patch in $(ls -1 "$FALLBACK_DIR"/*.patch 2>/dev/null | sort); do
+                git apply --check "$patch" 2>/dev/null && git apply --verbose "$patch"
+              done
+            fi
+          fi
 
-              raise RuntimeError(f"Failed to download {filename} from all sources (original: {url})")
+          # --- 强力兜底：确保 ARM64 下不安装 ROCm ---
+          # 解决 linux_rocky8_setup.sh 在 ARM64 上尝试安装 AMD 计算库导致的崩溃
+          SETUP_SCRIPT="build_files/build_environment/linux/linux_rocky8_setup.sh"
+          if [ -f "$SETUP_SCRIPT" ] && ! grep -q 'if \[ "$(uname -i)" != "aarch64" \]' "$SETUP_SCRIPT"; then
+            echo "Injecting aarch64 check for ROCm in $SETUP_SCRIPT"
+            sed -i '/# Register ROCm packages/i if [ "$(uname -i)" != "aarch64" ]; then' "$SETUP_SCRIPT"
+            sed -i '/update-alternatives --set rocm/a fi' "$SETUP_SCRIPT"
+          fi
 
-          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-              futures = [executor.submit(download, url, dest, fn) for url, dest, fn in tasks]
-              for future in concurrent.futures.as_completed(futures):
-                  future.result()
-
-          print(f"\nAll dependencies downloaded and ready in {PKG_DIR}")
-          PYEOF
-
-      # --------------------------------------------------
-      # 6. 编译依赖、主程序与打包
-      # --------------------------------------------------
-      - name: Build Blender Dependencies
+      - name: Install build dependencies
         shell: bash
         run: |
-          set -euxo pipefail
-          cd "$SOURCE_DIR"
+          retry() {
+            local max_attempts="$1"
+            local delay_seconds="$2"
+            shift 2
+            local attempt=1
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Command failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              echo "Attempt ${attempt}/${max_attempts} failed: $*"
+              echo "Retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              attempt=$((attempt + 1))
+            done
+          }
 
-          # 修正 include 顺序，确保 BLENDER_PLATFORM_ARM 在编译 OpenSSL 前被定义
-          CMAKE_LIST="build_files/build_environment/CMakeLists.txt"
-          awk '
-            /include\(cmake\/options\.cmake\)/ {
-              print;
-              print "include(cmake/versions.cmake)";
-              next
-            }
-            /include\(cmake\/versions\.cmake\)/ {
-              next
-            }
-            { print }
-          ' "$CMAKE_LIST" > "${CMAKE_LIST}.tmp" && mv "${CMAKE_LIST}.tmp" "$CMAKE_LIST"
+          chmod +x ~/blender-git/blender/build_files/build_environment/linux/linux_rocky8_setup.sh
+          retry 10 15 ~/blender-git/blender/build_files/build_environment/linux/linux_rocky8_setup.sh
+          echo "Cleaning dnf cache..."
+          dnf clean all
 
-          echo "--- Reordered CMakeLists.txt includes ---"
-          grep -n "include(cmake/" "$CMAKE_LIST"
+      - name: Cache Blender dependencies
+        uses: actions/cache@v4
+        id: cache-deps
+        with:
+          path: ~/blender-git/blender/lib/linux_arm64
+          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v1
+          restore-keys: |
+            blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-
 
-          # 清理旧的 CMake 缓存，防止错误的 SSL_OS_COMPILER 配置被复用
-          rm -rf "$BUILD_DIR/deps_arm64/CMakeCache.txt" "$BUILD_DIR/deps_arm64/CMakeFiles"
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /root/.ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ runner.arch }}-
 
-          make deps -j"$BUILD_JOBS" \
-            DEPS_BUILD_COMMAND="make -s" \
-            ARGS="-DPACKAGE_DIR=$PKG_DIR -DPACKAGE_USE_UPSTREAM_SOURCES=OFF"
+      - name: Configure ccache
+        run: |
+          export CCACHE_DIR=/root/.ccache
+          ccache --max-size=2G
+          ccache --show-config
+          ccache --zero-stats
+          ccache --show-stats
+
+      - name: Build dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
+        shell: bash
+        run: |
+          retry() {
+            local max_attempts="$1"
+            local delay_seconds="$2"
+            shift 2
+            local attempt=1
+            until "$@"; do
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Command failed after ${max_attempts} attempts: $*"
+                return 1
+              fi
+              echo "Attempt ${attempt}/${max_attempts} failed: $*"
+              echo "Retrying in ${delay_seconds}s..."
+              sleep "$delay_seconds"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          source /opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/enable
+          export CCACHE_DIR=/root/.ccache
+          cd ~/blender-git/blender
+          
+          # 尝试规避部分依赖在编译时需要 CUDA 的问题
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+          export PATH=/usr/local/cuda/bin${PATH:+:${PATH}}
+          export LANG=en_US.UTF-8
+          
+          export CC=/opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/root/usr/bin/gcc
+          export CXX=/opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/root/usr/bin/g++
+          
+          retry 10 15 make deps -j$(nproc)
+          unset CC CXX
+
+      - name: Save Blender dependencies cache
+        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/blender-git/blender/lib/linux_arm64
+          key: blender-deps-${{ github.event.inputs.blender_version }}-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Clean dependencies build artifacts
+        if: steps.cache-deps.outputs.cache-hit != 'true' || github.event.inputs.rebuild_deps == true
+        run: |
+          echo "Cleaning dependencies build directory to save space..."
+          rm -rf ~/blender-git/build_linux
+          echo "Dependencies build directory cleaned"
+
+      - name: Verify dependencies
+        run: |
+          echo "Checking dependencies directory..."
+          ls -lah ~/blender-git/blender/lib/linux_arm64/ || echo "Dependencies not found!"
 
       - name: Build Blender
         shell: bash
         run: |
-          set -euxo pipefail
-          cd "$SOURCE_DIR"
-          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
-          ccache --max-size=4G
+          source /opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/enable
+          export CCACHE_DIR=/root/.ccache
+          
+          mkdir -p ~/blender-git/build_linux_${{ github.event.inputs.build_type }}
+          cd ~/blender-git/build_linux_${{ github.event.inputs.build_type }}
+          
+          CMAKE_ARGS=(
+            -G Ninja
+            -DCMAKE_BUILD_TYPE=Release
+            -DWITH_LIBS_PRECOMPILED=ON
+            -DLIBDIR=$HOME/blender-git/blender/lib/linux_arm64
+            -DWITH_INSTALL_PORTABLE=ON
+            -DCPACK_BINARY_TGZ=ON
+            -DCPACK_BINARY_STGZ=OFF
+            -DCPACK_BINARY_TZ=OFF
+            -DCPACK_SOURCE_TBZ2=OFF
+            -DCPACK_SOURCE_TGZ=OFF
+            -DCPACK_SOURCE_TXZ=OFF
+            -DCPACK_SOURCE_TZ=OFF
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          )
+
+          if [ "${{ github.event.inputs.build_type }}" == "release" ]; then
+            cmake -C ../blender/build_files/cmake/config/blender_release.cmake "${CMAKE_ARGS[@]}" ../blender
+          elif [ "${{ github.event.inputs.build_type }}" == "lite" ]; then
+            cmake -C ../blender/build_files/cmake/config/blender_lite.cmake "${CMAKE_ARGS[@]}" ../blender
+          else
+            CMAKE_ARGS[1]="Debug"
+            cmake "${CMAKE_ARGS[@]}" ../blender
+          fi
+
+          echo "Building Blender..."
+          ninja
+          
+          echo "Build completed successfully!"
+          echo "ccache statistics:"
           ccache --show-stats
-          make config ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
-          make -j"$BUILD_JOBS"
-          ccache --show-stats
+
+      - name: Save ccache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: /root/.ccache
+          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Package Blender
         shell: bash
         run: |
-          set -euxo pipefail
-          cd "$SOURCE_DIR"
-          make package
-          mkdir -p "$DIST_DIR"
-          find "$BUILD_DIR" -name "*.tar.*" -exec cp {} "$DIST_DIR/" \;
-          ls -lh "$DIST_DIR"
+          source /opt/rh/gcc-toolset-${{ github.event.inputs.gcc_version }}/enable
+          export CCACHE_DIR=/root/.ccache
+          ccache -C
+          cd ~/blender-git/build_linux_${{ github.event.inputs.build_type }}
+          echo "Packaging Blender..."
+          cpack
+          echo "Calculating sha256 checksums..."
+          find . -maxdepth 1 \( -name "*.tar.gz" \) -type f -printf "%P\0" | xargs -0 sha256sum | sort -k2 > sha256sums.txt
+          echo "Packaging completed successfully!"
 
-      # --------------------------------------------------
-      # 7. 产物上传与发布
-      # --------------------------------------------------
-      - name: Upload Build Artifacts
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: blender-linux-arm64-package
-          path: ${{ env.DIST_DIR }}/*.tar.*
-          if-no-files-found: error
+          name: blender-linux-arm64-${{ github.event.inputs.blender_version }}-${{ github.event.inputs.build_type }}
+          path: |
+            ~/blender-git/build_linux_${{ github.event.inputs.build_type }}/*.tar.gz
+            ~/blender-git/build_linux_${{ github.event.inputs.build_type }}/sha256sums.txt
+          retention-days: 90
 
-      - name: Publish GitHub Release
-        if: ${{ inputs.publish_release }}
+      - name: Notify webhook on build failure
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          if [ -z "${WEBHOOK_URL:-}" ]; then
+            echo "WEBHOOK_URL is not configured, skipping failure notification"
+            exit 0
+          fi
+
+          if ! command -v curl >/dev/null 2>&1; then
+            echo "curl is not available, skipping failure notification"
+            exit 0
+          fi
+
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          payload=$(cat <<EOF
+          {
+            "msg_type": "post",
+            "content": {
+              "post": {
+                "zh_cn": {
+                  "title": "GitHub CI Activity",
+                  "content": [
+                    [
+                      {
+                        "tag": "text",
+                        "text": "Some jobs were not successful: "
+                      },
+                      {
+                        "tag": "a",
+                        "text": "View workflow run",
+                        "href": "${RUN_URL}"
+                      }
+                    ]
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          )
+
+          curl --fail --show-error --silent -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK_URL"
+
+  draft-release:
+    if: ${{ github.event.inputs.draft_release == 'true' }}
+    needs:
+      - build
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Build release notes with checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          checksums=$(find ./artifacts -type f -name "sha256sums.txt" -exec cat {} \; -exec echo \; | awk 'NF>=2 {print $1 "  " $2}' | sort -k2,2)
+          cat <<'EOF' > release_body.md
+          ## Checksums
+          ```plaintext
+          EOF
+          printf '%s\n' "$checksums" >> release_body.md
+          printf '%s\n' '```' >> release_body.md
+
+      - name: Upload archives to draft release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.BLENDER_TAG }}-arm64
-          name: Blender ${{ env.BLENDER_TAG }} (Linux ARM64)
-          files: ${{ env.DIST_DIR }}/*.tar.*
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ github.event.inputs.blender_version }}
+          name: Blender ${{ github.event.inputs.blender_version }} (Linux ARM64)
+          draft: true
+          body_path: release_body.md
+          files: |
+            ./artifacts/**/*.tar.gz
